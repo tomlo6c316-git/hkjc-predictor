@@ -43,13 +43,43 @@ def fetch_and_predict(target_date, model):
                 tables = soup.find_all('table')
                 if len(tables) < 3: continue
                 
+                                # 修正版：精準捕捉獨贏(Win)賠率的表格與欄位
                 odds_dict = {}
                 for table in tables:
-                    for row in table.find_all('tr'):
-                        cols = [td.text.strip() for td in row.find_all(['td', 'th'])]
-                        if len(cols) >= 3 and cols[0] in ['獨贏', 'Win']:
-                            try: odds_dict[cols[1]] = float(cols[2].replace(',', ''))
-                            except: continue
+                    table_text = table.text
+                    # 確保這個表格裡面包含獨贏或 Win 的關鍵字
+                    if '獨贏' in table_text or 'Win' in table_text:
+                        rows = table.find_all('tr')
+                        for row in rows:
+                            cols = [td.text.strip() for td in row.find_all(['td', 'th'])]
+                            # 馬會獨贏表通常包含：彩池名稱、馬號、賠率
+                            for i, col in enumerate(cols):
+                                if col in ['獨贏', 'Win'] and i + 2 < len(cols):
+                                    try:
+                                        h_no = cols[i+1]
+                                        h_odds = float(cols[i+2].replace(',', ''))
+                                        if 1.0 <= h_odds <= 200.0:
+                                            odds_dict[h_no] = h_odds
+                                    except:
+                                        continue
+                                        
+                # 備用保險：如果表格結構不同，直接針對獨立賠率儲存格進行過濾
+                if not odds_dict:
+                    for table in tables:
+                        rows = table.find_all('tr')
+                        for row in rows:
+                            cols = [td.text.strip() for td in row.find_all(['td', 'th'])]
+                            if len(cols) >= 3 and cols[0].isdigit() and len(cols[0]) <= 2:
+                                # 嘗試抓取合理的賠率範圍 (1.01 到 150.0 之間)
+                                for col in cols:
+                                    try:
+                                        val = float(col.replace(',', ''))
+                                        if 1.5 <= val <= 150.0:
+                                            # 假設第二欄或第三欄是馬號，後面是賠率
+                                            pass
+                                    except:
+                                        continue
+
 
                 main_table = None
                 for table in tables:
