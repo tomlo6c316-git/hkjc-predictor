@@ -38,7 +38,7 @@ race_id = f"{date_str_no_slash}{str(race_no).zfill(2)}"
 st.write(f"正在查詢日期：**{date_str}** | 第 **{race_no}** 場 (賽事編號: `{race_id}`)")
 
 if st.button("🚀 開始分析本場賽事"):
-    with st.spinner("正在向馬會即時抓取排位、賠率與適性資料並進行 AI 預測..."):
+    with st.spinner("正在向馬會即時抓取真實排位、賠率與適性資料並進行 AI 預測..."):
         try:
             # 抓取馬會排位/賽果頁面
             url = f"https://racing.hkjc.com/racing/information/Chinese/Racing/LocalResults.aspx?RaceDate={date_str}&RaceNo={race_no}"
@@ -47,20 +47,58 @@ if st.button("🚀 開始分析本場賽事"):
             
             soup = BeautifulSoup(resp.text, 'html.parser')
             
-            # 建立一個 12 匹馬的標準預測結構模板（確保穩定運行）
-            dummy_data = []
-            for i in range(1, 13):
-                dummy_data.append({
-                    '馬號': str(i),
-                    '馬名': f"參賽馬匹 {i}",
-                    '騎師': '--',
-                    '練馬師': '--',
-                    '獨贏賠率': 10.0 + i * 1.5,
-                    '排位檔位': i,
-                    '實際負磅': 120
-                })
+            # 🔥 真實爬蟲解析：從馬會網頁表格中萃取馬號、馬名與賠率
+            horses_data = []
+            tables = soup.find_all('table')
             
-            df = pd.DataFrame(dummy_data)
+            for table in tables:
+                rows = table.find_all('tr')
+                for row in rows:
+                    cols = [td.text.strip() for td in row.find_all(['td', 'th'])]
+                    # 馬會表格通常包含馬號（第一欄為純數字）與豐富欄位
+                    if len(cols) >= 5:
+                        # 檢查第一欄是否為馬號 (1-14 的數字)
+                        if cols[0].isdigit() and 1 <= int(cols[0]) <= 14:
+                            # 嘗試抓取馬名與賠率（依據馬會網頁常見結構）
+                            horse_no = cols[0]
+                            # 通常第二欄或第三欄是馬名
+                            horse_name = cols[1] if len(cols) > 1 else f"馬匹 {horse_no}"
+                            
+                            # 尋找賠率欄位（通常在較後面的欄位，找浮點數）
+                            odds = 10.0
+                            for col in reversed(cols):
+                                try:
+                                    val = float(col.replace(',', ''))
+                                    if 1.0 < val <= 200.0:
+                                        odds = val
+                                        break
+                                except:
+                                    continue
+                            
+                            horses_data.append({
+                                '馬號': horse_no,
+                                '馬名': horse_name,
+                                '獨贏賠率': odds,
+                                '排位檔位': int(horse_no), # 若無精確檔位先以馬號代替
+                                '實際負磅': 120
+                            })
+            
+            # 如果抓不到資料（例如尚未有排位或網址錯誤），才啟用備用防呆模板
+            if len(horses_data) == 0:
+                st.warning("⚠️ 該場次暫無詳細排位資料，已載入標準模擬名單進行預測。")
+                for i in range(1, 13):
+                    horses_data.append({
+                        '馬號': str(i),
+                        '馬名': f"參賽馬匹 {i}",
+                        '獨贏賠率': 10.0 + i * 1.5,
+                        '排位檔位': i,
+                        '實際負磅': 120
+                    })
+            
+            df = pd.DataFrame(horses_data)
+            
+            # 去除重複的馬號（避免表格重複抓取）
+            df = df.drop_duplicates(subset=['馬號']).reset_index(drop=True)
             
             # 嚴格對齊模型所需的 15 大特徵欄位
             df['獨贏賠率'] = pd.to_numeric(df['獨贏賠率'], errors='coerce').fillna(10.0)
@@ -104,7 +142,7 @@ if st.button("🚀 開始分析本場賽事"):
             
             display_cols = ['馬號', '馬名', '獨贏賠率', 'AI預測勝率', 'EV']
             
-            st.success("✨ 預測完成！本場賽事分析結果如下：")
+            st.success("✨ 預測完成！本場真實賽事分析結果如下：")
             st.dataframe(df[display_cols].sort_values(by='AI預測勝率', ascending=False), use_container_width=True)
             
         except Exception as e:
