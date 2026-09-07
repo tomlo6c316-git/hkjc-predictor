@@ -60,13 +60,31 @@ if st.button("🚀 開始分析本場賽事"):
                 df = target_df.copy()
                 
                 # 確保必要欄位存在，若無則給予預設值以便模擬預測
+                                # 確保必要欄位存在，若無則給予預設值以便模擬預測
                 if '獨贏賠率' not in df.columns:
-                    # 嘗試從其他欄位尋找賠率或賦予預設測試賠率
                     df['獨贏賠率'] = 10.0
-                
-                df['獨贏賠率'] = pd.to_numeric(df['獨贏賠率'], errors='coerce').fillna(10.0)
-                df['排位檔位'] = pd.to_numeric(df.get('排位檔位', 7), errors='coerce').fillna(7)
-                df['實際負磅'] = pd.to_numeric(df.get('實際負磅', 120), errors='coerce').fillna(120)
+                else:
+                    df['獨贏賠率'] = pd.to_numeric(df['獨贏賠率'], errors='coerce')
+                    # 如果整欄都是空的或找不到，直接填入預設值 10.0
+                    if df['獨贏賠率'].isnull().all():
+                        df['獨贏賠率'] = 10.0
+                    else:
+                        df['獨贏賠率'] = df['獨贏賠率'].fillna(10.0)
+
+                # 檔位安全處理
+                if '排位檔位' not in df.columns:
+                    df['排位檔位'] = 7
+                else:
+                    df['排位檔位'] = pd.to_numeric(df['排位檔位'], errors='coerce')
+                    df['排位檔位'] = df['排位檔位'].fillna(7)
+
+                # 實際負磅安全處理
+                if '實際負磅' not in df.columns:
+                    df['實際負磅'] = 120
+                else:
+                    df['實際負磅'] = pd.to_numeric(df['實際負磅'], errors='coerce')
+                    df['實際負磅'] = df['實際負磅'].fillna(120)
+
                 
                 # 建構 15 大特徵給模型進行預測
                 df['market_prob'] = 1 / df['獨贏賠率']
@@ -83,7 +101,7 @@ if st.button("🚀 開始分析本場賽事"):
                 df['trainer_win_rate'] = 0.10
                 df['combo_win_rate'] = 0.08
                 df['horse_win_rate'] = 0.08
-                df['horse_last_rank'] = 6.0
+                df['horse_last_arank'] = 6.0
                 df['距離'] = 1200
                 df['horse_surface_win_rate'] = 0.08
                 df['horse_dist_win_rate'] = 0.08
