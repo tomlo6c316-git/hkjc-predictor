@@ -148,9 +148,8 @@ if run_button:
                         
                         if len(sorted_group) >= 2:
                             top1, top2, top3 = sorted_group.iloc[0], sorted_group.iloc[1], sorted_group.iloc[2] if len(sorted_group) >= 3 else sorted_group.iloc[1]
-                            st.info(f"💡 **組合建議**：
-- **連贏(Q)**：{top1['馬號']} + {top2['馬號']} ({top1['馬名']} / {top2['馬名']})
-- **位置Q(QP)**：{top1['馬號']} + {top2['馬號']} 或 {top1['馬號']} + {top3['馬號']}")
+                            st.info(f"💡 **組合建議**：\n- **連贏(Q)**：{top1['馬號']} + {top2['馬號']} ({top1['馬名']} / {top2['馬名']})\n- **位置Q(QP)**：{top1['馬號']} + {top2['馬號']} 或 {top1['馬號']} + {top3['馬號']}")
+
                     else:
                         st.warning("此場賽事暫無符合門檻的高 EV 馬匹。")
                     
