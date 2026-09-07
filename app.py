@@ -21,6 +21,15 @@ try:
 except Exception as e:
     st.error(f"⚠️ 模型載入失敗，請確認 GitHub 根目錄是否有上傳 `my_hkjc_model.pkl`。錯誤訊息: {e}")
 
+# ==========================================
+# 側邊欄：投注策略與參數調校選項
+# ==========================================
+st.sidebar.header("🎛️ 投資策略與篩選設定")
+min_ev_filter = st.sidebar.slider("最低期望值 (Min EV 篩選)", min_value=0.0, max_value=2.0, value=0.0, step=0.05, help="只顯示 EV 大於此數值的馬匹（EV = 預測勝率 × 賠率）")
+max_odds_filter = st.sidebar.slider("最高獨贏賠率上限", min_value=5.0, max_value=200.0, value=100.0, step=5.0, help="過濾掉賠率過高的冷門馬")
+min_odds_filter = st.sidebar.slider("最低獨贏賠率下限", min_value=1.0, max_value=20.0, value=1.0, step=0.5, help="過濾掉賠率過低的超大熱門")
+
+# 主頁面輸入
 col1, col2 = st.columns(2)
 with col1:
     race_date_input = st.date_input("選擇賽事日期", datetime.date(2026, 9, 9))
@@ -34,9 +43,9 @@ race_id = f"{date_str_no_slash}{str(race_no).zfill(2)}"
 st.write(f"正在查詢日期：**{date_str}** | 第 **{race_no}** 場 (賽事編號: `{race_id}`)")
 
 if st.button("🚀 開始分析本場賽事"):
-    with st.spinner("正在向馬會即時抓取真實排位、賠率與適性資料並進行 AI 預測..."):
+    with st.spinner("正在向馬會即時抓取最新排位與賠率資料並進行 AI 預測..."):
         try:
-            url = f"https://racing.hkjc.com/racing/information/Chinese/Racing/LocalResults.aspx?RaceDate={date_str}&RaceNo={race_no}"
+            url = f"https://racing.hkjc.com/racing/information/Chinese/Racing/RaceCard.aspx?RaceDate={date_str}&RaceNo={race_no}"
             headers = {'User-Agent': 'Mozilla/5.0'}
             resp = requests.get(url, headers=headers, timeout=5)
             
@@ -50,20 +59,16 @@ if st.button("🚀 開始分析本場賽事"):
                 for row in rows:
                     cols = [td.text.strip() for td in row.find_all(['td', 'th'])]
                     if len(cols) >= 5:
-                        # 尋找包含中文馬名的欄位與合理的賠率
                         horse_no = None
                         horse_name = None
-                        odds = None
+                        odds = 10.0
                         
                         for col in cols:
-                            # 判斷是否為馬號 (1-14 的純數字)
                             if col.isdigit() and 1 <= int(col) <= 14 and not horse_no:
                                 horse_no = col
-                            # 判斷是否為馬名（包含中文字且長度大於1）
                             elif any('\u4e00' <= c <= '\u9fff' for c in col) and len(col) >= 2 and not horse_name:
                                 if col not in ['獨贏', '位置', '連贏', '二重彩', '組合獨贏', '草地', '泥地', '騎師', '練馬師']:
                                     horse_name = col
-                            # 抓取賠率
                             try:
                                 val = float(col.replace(',', ''))
                                 if 1.0 < val <= 200.0:
@@ -71,7 +76,7 @@ if st.button("🚀 開始分析本場賽事"):
                             except:
                                 pass
                                 
-                        if horse_no and horse_name and odds:
+                        if horse_no and horse_name:
                             horses_data.append({
                                 '馬號': horse_no,
                                 '馬名': horse_name,
@@ -80,14 +85,13 @@ if st.button("🚀 開始分析本場賽事"):
                                 '實際負磅': 120
                             })
             
-            # 移除重複馬號
             if len(horses_data) > 0:
                 temp_df = pd.DataFrame(horses_data)
                 temp_df = temp_df.drop_duplicates(subset=['馬號']).reset_index(drop=True)
                 horses_data = temp_df.to_dict('records')
             
             if len(horses_data) == 0:
-                st.warning("⚠️ 該場次暫無詳細排位資料，已載入標準模擬名單進行預測。")
+                st.warning("⚠️ 該場次暫無排位資料，已載入標準模擬名單進行預測。")
                 for i in range(1, 13):
                     horses_data.append({
                         '馬號': str(i),
@@ -134,10 +138,17 @@ if st.button("🚀 開始分析本場賽事"):
             df['AI預測勝率'] = df['AI預測勝率'] / df['AI預測勝率'].sum()
             df['EV'] = df['AI預測勝率'] * df['獨贏賠率']
             
+            # 根據側邊欄的設定進行過濾
+            filtered_df = df[
+                (df['EV'] >= min_ev_filter) & 
+                (df['獨贏賠率'] <= max_odds_filter) & 
+                (df['獨贏賠率'] >= min_odds_filter)
+            ].copy()
+            
             display_cols = ['馬號', '馬名', '獨贏賠率', 'AI預測勝率', 'EV']
             
-            st.success("✨ 預測完成！本場真實賽事分析結果如下：")
-            st.dataframe(df[display_cols].sort_values(by='AI預測勝率', ascending=False), use_container_width=True)
+            st.success(f"✨ 預測完成！符合篩選條件的馬匹共 {len(filtered_df)} 匹：")
+            st.dataframe(filtered_df[display_cols].sort_values(by='AI預測勝率', ascending=False), use_container_width=True, hide_index=True)
             
         except Exception as e:
             st.error(f"⚠️ 抓取或預測過程中發生錯誤: {e}")
