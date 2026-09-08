@@ -1,8 +1,8 @@
 streamlit
 pandas
 numpy
-joblib
 requests
 beautifulsoup4
-lxml
+joblib
 lightgbm
+scikit-learn
