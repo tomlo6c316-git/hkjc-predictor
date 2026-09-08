@@ -154,7 +154,6 @@ if run_button:
     f"- **位置Q(QP)**：{top1['馬號']} + {top2['馬號']} 或 {top1['馬號']} + {top3['馬號']}"
 )
 st.info(suggestion_text)
-
                     else:
                         st.warning("此場賽事暫無符合門檻的高 EV 馬匹。")
                     
