@@ -11,7 +11,22 @@ st.set_page_config(page_title="HKJC AI 智能量化預測", page_icon="🏇", la
 st.title("🏇 香港賽馬 AI 智能量化預測系統")
 st.markdown("支援 **獨贏 (Win) / 連贏 (Q) / 位置Q (QP)** 多維度價值投注分析")
 
-st.sidebar.header("⚙️ 賽事設定")
+st.sidebar.header("📂 資料載入")
+uploaded_file = st.sidebar.file_uploader("請上傳今日賽事排位表 (CSV)", type=['csv'])
+
+if uploaded_file is not None:
+    # 使用者有上傳檔案，進行雙編碼容錯讀取
+    try:
+        df_raw = pd.read_csv(uploaded_file, encoding='utf-8-sig')
+    except:
+        uploaded_file.seek(0)
+        df_raw = pd.read_csv(uploaded_file, encoding='cp950')
+    st.success("✅ 賽事資料載入成功！")
+else:
+    # 使用者還沒上傳檔案
+    st.warning("👈 請在左側上傳今天的賽事 CSV 檔案來啟動預測！")
+    st.stop()  # 停止執行後續的預測程式，直到檔案上傳
+
 race_date_input = st.sidebar.text_input("輸入賽事日期 (格式: YYYY/MM/DD)", "2026/09/09")
 ev_threshold = st.sidebar.slider("EV 期望值門檻", 1.0, 1.5, 1.15, 0.05)
 min_odds = st.sidebar.slider("最低賠率門檻", 1.0, 20.0, 3.0, 0.5)
