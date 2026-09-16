@@ -26,7 +26,7 @@ def load_model():
 model = load_model()
 
 if model is None:
-    st.error(f"⚠️ 找不到 AI 模型檔 `{MODEL_PATH}`！請確認模型是否已上傳至正確目錄。")
+    st.error(f"⚠️ 找不到 AI 模型檔 `{MODEL_PATH}`！")
     st.stop()
 
 # 側邊欄：檔案上傳區與參數設定
@@ -34,13 +34,12 @@ st.sidebar.header("📂 資料載入")
 uploaded_file = st.sidebar.file_uploader("請上傳賽事資料 (CSV)", type=['csv'])
 
 st.sidebar.markdown("---")
-st.sidebar.header("⚙️ 投注策略參數設定")
-min_ev = st.sidebar.slider("最小期望值 (EV 門檻)", 0.0, 1.5, 0.0, 0.05)
+st.sidebar.header("⚙️ 投注策略參數")
+min_ev = st.sidebar.slider("最小期望值 (EV)", 0.0, 1.5, 0.0, 0.05)
 min_odds = st.sidebar.number_input("最低獨贏賠率", min_value=1.0, max_value=50.0, value=3.0)
-max_odds = st.sidebar.number_input("最高獨贏賠率", min_value=1.0, max_value=100.0, value=20.0)
+max_odds = st.sidebar.number_input("最高獨贏賠率", min_value=1.0, max_value=100.0, value=30.0)
 
 if uploaded_file is not None:
-    # 雙編碼容錯讀取
     try:
         df_raw = pd.read_csv(uploaded_file, encoding='utf-8-sig')
     except:
@@ -49,10 +48,31 @@ if uploaded_file is not None:
         
     st.success("✅ 賽事資料載入成功！")
     
-    df = df_raw.copy()
+    # ==========================================
+    # 🌟 新功能：互動式臨場賠率輸入面板
+    # ==========================================
+    st.subheader("⚡ 快速輸入臨場賠率 (支援手機直接點擊修改)")
+    st.info("👇 點擊下方表格的『獨贏賠率』欄位即可修改數字。修改後，AI 會自動重新計算推薦名單！")
     
-    # 1. 特徵工程
-    df['獨贏賠率'] = pd.to_numeric(df['獨贏賠率'], errors='coerce').fillna(10.0)
+    # 準備供使用者編輯的欄位 (鎖定其他欄位，只允許修改賠率)
+    edit_columns = ['賽事編號', '馬號', '馬名', '排位檔位', '獨贏賠率']
+    df_editable = df_raw[edit_columns].copy()
+    
+    # 使用 st.data_editor 讓表格變成可編輯
+    edited_df = st.data_editor(
+        df_editable,
+        disabled=['賽事編號', '馬號', '馬名', '排位檔位'], # 禁止修改這些欄位防呆
+        use_container_width=True,
+        hide_index=True
+    )
+    
+    # 將使用者輸入的最新賠率，覆蓋回原始 DataFrame
+    df = df_raw.copy()
+    df['獨贏賠率'] = pd.to_numeric(edited_df['獨贏賠率'], errors='coerce').fillna(10.0)
+    
+    # ==========================================
+    # 1. 特徵工程 (依照最新輸入的賠率即時運算)
+    # ==========================================
     df['market_prob'] = 1 / df['獨贏賠率']
     prob_sum = df.groupby('賽事編號')['market_prob'].transform('sum')
     df['market_implied_prob'] = df['market_prob'] / prob_sum
@@ -70,9 +90,7 @@ if uploaded_file is not None:
         df['weight_diff'] = 0.0
         df['weight_rank'] = 6.0
 
-    # 解析名次（用於回測判斷）
     df['numeric_rank'] = pd.to_numeric(df.get('名次', 99), errors='coerce').fillna(99)
-
     df['jockey_win_rate'] = df.get('jockey_win_rate', 0.12)
     df['trainer_win_rate'] = df.get('trainer_win_rate', 0.12)
     df['combo_win_rate'] = df.get('combo_win_rate', 0.10)
@@ -101,14 +119,15 @@ if uploaded_file is not None:
     df['pred_win_prob'] = model.predict_proba(X_predict)[:, 1]
     df['ev'] = df['pred_win_prob'] * df['獨贏賠率']
 
+    st.markdown("---")
+    
     # ==========================================
-    # 建立雙分頁 UI (預測 vs 回測)
+    # 雙分頁 UI (預測 vs 回測)
     # ==========================================
     tab1, tab2 = st.tabs(["🎯 各場次預測推薦", "📈 歷史回測 (ROI 統計)"])
 
-    # ---------------- 分頁 1: 賽前預測 ----------------
     with tab1:
-        st.subheader("🎯 各場次 AI 智慧投注推薦清單")
+        st.subheader("🎯 AI 智慧投注推薦清單")
 
         recommendations = []
         for race_id, group in df.groupby('賽事編號'):
@@ -121,86 +140,49 @@ if uploaded_file is not None:
                 top3 = sorted_group.iloc[2] if len(sorted_group) >= 3 else top2
 
                 win_pick = f"馬號 {top1['馬號']} ({top1['馬名']}) [勝率:{top1['pred_win_prob']*100:.1f}%, EV:{top1['ev']:.2f}]"
-                q_pick = f"{top1['馬號']} + {top2['馬號']} ({top1['馬名']} / {top2['馬名']})"
-                qp_pick = f"{top1['馬號']} + {top2['馬號']} 或 {top1['馬號']} + {top3['馬號']}"
+                q_pick = f"{top1['馬號']} + {top2['馬號']}"
+                qp_pick = f"{top1['馬號']} + {top2['馬號']} / {top3['馬號']}"
 
                 recommendations.append({
                     '賽事編號': race_id,
                     '🎯 獨贏推薦': win_pick,
-                    '🔗 連贏推薦 (Q)': q_pick,
-                    '🔗 位置Q推薦 (QP)': qp_pick
+                    '🔗 Q / QP': q_pick + " | " + qp_pick
                 })
 
         rec_df = pd.DataFrame(recommendations)
         if rec_df.empty:
-            st.warning("⚠️ 沒有符合當前篩選條件的馬匹，請試著放寬左側欄的 EV 或賠率限制。")
+            st.warning("⚠️ 沒有符合當前 EV 或賠率門檻的馬匹。")
         else:
             st.dataframe(rec_df, use_container_width=True)
 
-    # ---------------- 分頁 2: 賽後回測 ----------------
     with tab2:
         st.subheader("📊 獨贏 (Win) 策略回測結果")
-        
-        # 防呆檢查：確認上傳的檔案裡有沒有真實的「名次」數據
         if (df['numeric_rank'] == 99).all():
-            st.warning("⚠️ 系統偵測到目前的 CSV 中沒有真實的『名次』紀錄 (或全部為空值)。請上傳已完賽並包含名次結果的歷史檔案來執行回測。")
+            st.info("💡 目前資料無真實名次，無法計算 ROI。請上傳歷史賽果以啟用回測。")
         else:
-            total_invested = 0
-            total_return = 0
-            bet_count = 0
-            win_count = 0
-            backtest_records = []
-            
-            # 以每場 100 元為基準進行模擬
+            total_invested, total_return, bet_count, win_count = 0, 0, 0, 0
             BET_AMOUNT = 100 
             
             for race_id, group in df.groupby('賽事編號'):
-                # 套用與預測完全相同的篩選條件
                 filtered_group = group[(group['ev'] >= min_ev) & (group['獨贏賠率'] >= min_odds) & (group['獨贏賠率'] <= max_odds)]
                 sorted_group = filtered_group.sort_values(by='ev', ascending=False).reset_index(drop=True)
                 
-                # 如果這場有符合條件的馬，只買 EV 最高的「那一匹」獨贏
                 if len(sorted_group) > 0:
                     pick = sorted_group.iloc[0]
                     bet_count += 1
                     total_invested += BET_AMOUNT
-                    
-                    is_win = (pick['numeric_rank'] == 1)
-                    if is_win:
+                    if pick['numeric_rank'] == 1:
                         win_count += 1
-                        payout = BET_AMOUNT * pick['獨贏賠率']
-                        total_return += payout
-                        result_str = "✅ 贏"
-                    else:
-                        payout = 0
-                        result_str = "❌ 輸"
-                        
-                    backtest_records.append({
-                        '賽事編號': race_id,
-                        '投注馬號': f"{pick['馬號']} ({pick['馬名']})",
-                        '實際名次': str(pick['名次']).replace('.0', ''),
-                        '獨贏賠率': pick['獨贏賠率'],
-                        'EV': round(pick['ev'], 2),
-                        '結果': result_str,
-                        '派彩': f"${payout:.1f}",
-                        '淨盈虧': f"${payout - BET_AMOUNT:.1f}"
-                    })
+                        total_return += BET_AMOUNT * pick['獨贏賠率']
             
-            # 統計與顯示區塊
             if bet_count > 0:
                 roi = ((total_return - total_invested) / total_invested) * 100
-                
-                # 使用 Streamlit 內建的 metric 元件來呈現儀表板質感
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("投注場數", f"{bet_count} 場")
                 col2.metric("命中場數", f"{win_count} 場", f"勝率: {win_count/bet_count*100:.1f}%")
-                col3.metric("總投入成本", f"${total_invested}")
-                col4.metric("總回收 (含本金)", f"${total_return:.1f}", f"ROI: {roi:.2f}%")
-                
-                st.markdown("#### 📝 詳細投注明細")
-                st.dataframe(pd.DataFrame(backtest_records), use_container_width=True)
+                col3.metric("總成本", f"${total_invested}")
+                col4.metric("總回收", f"${total_return:.1f}", f"ROI: {roi:.2f}%")
             else:
-                st.info("💡 在目前的 EV 和賠率設定下，本次回測沒有任何出手的場次。")
-
+                st.info("無符合投注條件的場次。")
 else:
-    st.info("👈 請在左側上傳賽事 CSV 檔案來啟動系統！")
+    st.info("👈 請在左側上傳今日賽前排位表 CSV 以啟動預測！")
