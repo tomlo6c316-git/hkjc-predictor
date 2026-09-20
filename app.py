@@ -83,12 +83,6 @@ if uploaded_file is not None:
     if 'horse_surface_win_rate' not in df.columns: df['horse_surface_win_rate'] = 0.08
     if 'horse_dist_win_rate' not in df.columns: df['horse_dist_win_rate'] = 0.08
 
-    # 位置賠率處理：若 CSV 無真實位置賠率，則依獨贏賠率自動轉換估算
-    if '位置賠率' in df.columns:
-        df['位置賠率'] = pd.to_numeric(df['位置賠率'], errors='coerce')
-    else:
-        df['位置賠率'] = 1.0 + (df['獨贏賠率'] - 1.0) / 3.2
-
     # 2. 提取 15 大特徵並預測勝率與 EV
     feature_cols = [
         'market_implied_prob', '獨贏賠率', 'odds_rank', 'is_favorite',
@@ -110,7 +104,7 @@ if uploaded_file is not None:
     # ==========================================
     # 建立雙分頁 UI (預測 vs 回測)
     # ==========================================
-    tab1, tab2 = st.tabs(["🎯 各場次預測推薦", "📈 歷史回測 (獨贏/位置/位置Q)"])
+    tab1, tab2 = st.tabs(["🎯 各場次預測推薦", "📈 歷史回測 (ROI 統計)"])
 
     # ---------------- 分頁 1: 賽前預測 ----------------
     with tab1:
@@ -145,169 +139,68 @@ if uploaded_file is not None:
 
     # ---------------- 分頁 2: 賽後回測 ----------------
     with tab2:
-        st.subheader("📊 多彩種策略回測總覽")
+        st.subheader("📊 獨贏 (Win) 策略回測結果")
         
         # 防呆檢查：確認上傳的檔案裡有沒有真實的「名次」數據
         if (df['numeric_rank'] == 99).all():
             st.warning("⚠️ 系統偵測到目前的 CSV 中沒有真實的『名次』紀錄 (或全部為空值)。請上傳已完賽並包含名次結果的歷史檔案來執行回測。")
         else:
-            sub_tab1, sub_tab2, sub_tab3 = st.tabs(["🥇 獨贏 (Win)", "🥈 位置 (Place)", "🔗 位置Q (QP)"])
+            total_invested = 0
+            total_return = 0
+            bet_count = 0
+            win_count = 0
+            backtest_records = []
+            
+            # 以每場 100 元為基準進行模擬
             BET_AMOUNT = 100 
             
-            # 1. 獨贏 (Win) 回測
-            with sub_tab1:
-                st.markdown("#### 🥇 獨贏 (Win) 策略回測")
-                win_invested, win_return, win_bets, win_hits = 0, 0, 0, 0
-                win_records = []
+            for race_id, group in df.groupby('賽事編號'):
+                # 套用與預測完全相同的篩選條件
+                filtered_group = group[(group['ev'] >= min_ev) & (group['獨贏賠率'] >= min_odds) & (group['獨贏賠率'] <= max_odds)]
+                sorted_group = filtered_group.sort_values(by='ev', ascending=False).reset_index(drop=True)
                 
-                for race_id, group in df.groupby('賽事編號'):
-                    filtered_group = group[(group['ev'] >= min_ev) & (group['獨贏賠率'] >= min_odds) & (group['獨贏賠率'] <= max_odds)]
-                    sorted_group = filtered_group.sort_values(by='ev', ascending=False).reset_index(drop=True)
+                # 如果這場有符合條件的馬，只買 EV 最高的「那一匹」獨贏
+                if len(sorted_group) > 0:
+                    pick = sorted_group.iloc[0]
+                    bet_count += 1
+                    total_invested += BET_AMOUNT
                     
-                    if len(sorted_group) > 0:
-                        pick = sorted_group.iloc[0]
-                        win_bets += 1
-                        win_invested += BET_AMOUNT
+                    is_win = (pick['numeric_rank'] == 1)
+                    if is_win:
+                        win_count += 1
+                        payout = BET_AMOUNT * pick['獨贏賠率']
+                        total_return += payout
+                        result_str = "✅ 贏"
+                    else:
+                        payout = 0
+                        result_str = "❌ 輸"
                         
-                        is_hit = (pick['numeric_rank'] == 1)
-                        if is_hit:
-                            win_hits += 1
-                            payout = BET_AMOUNT * pick['獨贏賠率']
-                            win_return += payout
-                            result_str = "✅ 贏"
-                        else:
-                            payout = 0
-                            result_str = "❌ 輸"
-                            
-                        win_records.append({
-                            '賽事編號': race_id,
-                            '投注馬號': f"{pick['馬號']} ({pick['馬名']})",
-                            '實際名次': str(pick['名次']).replace('.0', ''),
-                            '獨贏賠率': pick['獨贏賠率'],
-                            'EV': round(pick['ev'], 2),
-                            '結果': result_str,
-                            '派彩': f"${payout:.1f}",
-                            '淨盈虧': f"${payout - BET_AMOUNT:.1f}"
-                        })
+                    backtest_records.append({
+                        '賽事編號': race_id,
+                        '投注馬號': f"{pick['馬號']} ({pick['馬名']})",
+                        '實際名次': str(pick['名次']).replace('.0', ''),
+                        '獨贏賠率': pick['獨贏賠率'],
+                        'EV': round(pick['ev'], 2),
+                        '結果': result_str,
+                        '派彩': f"${payout:.1f}",
+                        '淨盈虧': f"${payout - BET_AMOUNT:.1f}"
+                    })
+            
+            # 統計與顯示區塊
+            if bet_count > 0:
+                roi = ((total_return - total_invested) / total_invested) * 100
                 
-                if win_bets > 0:
-                    roi = ((win_return - win_invested) / win_invested) * 100
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("投注場數", f"{win_bets} 場")
-                    col2.metric("命中場數", f"{win_hits} 場", f"勝率: {win_hits/win_bets*100:.1f}%")
-                    col3.metric("總成本", f"${win_invested}")
-                    col4.metric("總回收", f"${win_return:.1f}", f"ROI: {roi:.2f}%")
-                    
-                    st.markdown("##### 📝 獨贏明細")
-                    st.dataframe(pd.DataFrame(win_records), use_container_width=True)
-                else:
-                    st.info("💡 目前設定下沒有符合獨贏出手的場次。")
-
-            # 2. 位置 (Place) 回測
-            with sub_tab2:
-                st.markdown("#### 🥈 位置 (Place) 策略回測 (目標：跑入前三名)")
-                place_invested, place_return, place_bets, place_hits = 0, 0, 0, 0
-                place_records = []
+                # 使用 Streamlit 內建的 metric 元件來呈現儀表板質感
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("投注場數", f"{bet_count} 場")
+                col2.metric("命中場數", f"{win_count} 場", f"勝率: {win_count/bet_count*100:.1f}%")
+                col3.metric("總投入成本", f"${total_invested}")
+                col4.metric("總回收 (含本金)", f"${total_return:.1f}", f"ROI: {roi:.2f}%")
                 
-                for race_id, group in df.groupby('賽事編號'):
-                    filtered_group = group[(group['ev'] >= min_ev) & (group['獨贏賠率'] >= min_odds) & (group['獨贏賠率'] <= max_odds)]
-                    sorted_group = filtered_group.sort_values(by='ev', ascending=False).reset_index(drop=True)
-                    
-                    if len(sorted_group) > 0:
-                        pick = sorted_group.iloc[0]
-                        place_bets += 1
-                        place_invested += BET_AMOUNT
-                        
-                        is_hit = (pick['numeric_rank'] <= 3)
-                        p_odds = float(pick['位置賠率']) if pd.notna(pick['位置賠率']) and float(pick['位置賠率']) > 1.0 else 1.5
-                        
-                        if is_hit:
-                            place_hits += 1
-                            payout = BET_AMOUNT * p_odds
-                            place_return += payout
-                            result_str = "✅ 命中位置"
-                        else:
-                            payout = 0
-                            result_str = "❌ 未入前三"
-                            
-                        place_records.append({
-                            '賽事編號': race_id,
-                            '投注馬號': f"{pick['馬號']} ({pick['馬名']})",
-                            '實際名次': str(pick['名次']).replace('.0', ''),
-                            '位置賠率': round(p_odds, 2),
-                            'EV': round(pick['ev'], 2),
-                            '結果': result_str,
-                            '派彩': f"${payout:.1f}",
-                            '淨盈虧': f"${payout - BET_AMOUNT:.1f}"
-                        })
-                
-                if place_bets > 0:
-                    roi = ((place_return - place_invested) / place_invested) * 100
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("投注場數", f"{place_bets} 場")
-                    col2.metric("命中位置場數", f"{place_hits} 場", f"位置勝率: {place_hits/place_bets*100:.1f}%")
-                    col3.metric("總成本", f"${place_invested}")
-                    col4.metric("總回收", f"${place_return:.1f}", f"ROI: {roi:.2f}%")
-                    
-                    st.markdown("##### 📝 位置明細")
-                    st.dataframe(pd.DataFrame(place_records), use_container_width=True)
-                else:
-                    st.info("💡 目前設定下沒有符合位置出手的場次。")
-
-            # 3. 位置Q (Quinella Place) 回測
-            with sub_tab3:
-                st.markdown("#### 🔗 位置Q (QP) 策略回測 (挑選 EV 最高前兩匹，雙雙跑入前三名)")
-                qp_invested, qp_return, qp_bets, qp_hits = 0, 0, 0, 0
-                qp_records = []
-                
-                for race_id, group in df.groupby('賽事編號'):
-                    filtered_group = group[(group['ev'] >= min_ev) & (group['獨贏賠率'] >= min_odds) & (group['獨贏賠率'] <= max_odds)]
-                    sorted_group = filtered_group.sort_values(by='ev', ascending=False).reset_index(drop=True)
-                    
-                    if len(sorted_group) >= 2:
-                        top1 = sorted_group.iloc[0]
-                        top2 = sorted_group.iloc[1]
-                        
-                        qp_bets += 1
-                        qp_invested += BET_AMOUNT
-                        
-                        is_hit = (top1['numeric_rank'] <= 3) and (top2['numeric_rank'] <= 3)
-                        
-                        p1_odds = float(top1['位置賠率']) if pd.notna(top1['位置賠率']) else 1.5
-                        p2_odds = float(top2['位置賠率']) if pd.notna(top2['位置賠率']) else 1.5
-                        estimated_qp_odds = round(p1_odds * p2_odds * 1.8, 1)
-                        
-                        if is_hit:
-                            qp_hits += 1
-                            payout = BET_AMOUNT * estimated_qp_odds
-                            qp_return += payout
-                            result_str = "✅ 命中位置Q"
-                        else:
-                            payout = 0
-                            result_str = "❌ 落空"
-                            
-                        qp_records.append({
-                            '賽事編號': race_id,
-                            'QP 組合': f"{top1['馬號']} + {top2['馬號']} ({top1['馬名']} / {top2['馬名']})",
-                            '實際名次': f"首選:第{str(top1['名次']).replace('.0','')}名 | 次選:第{str(top2['名次']).replace('.0','')}名",
-                            '估算QP賠率': estimated_qp_odds,
-                            '結果': result_str,
-                            '派彩': f"${payout:.1f}",
-                            '淨盈虧': f"${payout - BET_AMOUNT:.1f}"
-                        })
-                
-                if qp_bets > 0:
-                    roi = ((qp_return - qp_invested) / qp_invested) * 100
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("投注場數", f"{qp_bets} 場")
-                    col2.metric("命中 QP 場數", f"{qp_hits} 場", f"QP 命中率: {qp_hits/qp_bets*100:.1f}%")
-                    col3.metric("總成本", f"${qp_invested}")
-                    col4.metric("總回收", f"${qp_return:.1f}", f"ROI: {roi:.2f}%")
-                    
-                    st.markdown("##### 📝 位置Q (QP) 明細")
-                    st.dataframe(pd.DataFrame(qp_records), use_container_width=True)
-                else:
-                    st.info("💡 目前設定下沒有符合位置 Q 出手的場次 (需同場至少有 2 匹馬符合 EV/賠率門檻)。")
+                st.markdown("#### 📝 詳細投注明細")
+                st.dataframe(pd.DataFrame(backtest_records), use_container_width=True)
+            else:
+                st.info("💡 在目前的 EV 和賠率設定下，本次回測沒有任何出手的場次。")
 
 else:
     st.info("👈 請在左側上傳賽事 CSV 檔案來啟動系統！")
