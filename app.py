@@ -1,733 +1,206 @@
-import pandas as pd
-
-import numpy as np
-
-import os
-
-import glob
-
-import joblib
-
-import lightgbm as lgb
-
-from sklearn.model_selection import train_test_split
-
-
-
-print("========== 🏆 啟動【LambdaRank 排序演算法】高階訓練系統 ==========")
-
-
-
-# 1. 掛載硬碟與設定路徑
-
-
-
-# 直接抓取同一個資料夾底下的模型檔
-
-MODEL_PATH = 'my_hkjc_ranker.pkl'
-
-
-
-
-
-# 2. 自動搜尋所有歷史 CSV 檔案
-
-search_patterns = ["hkjc_data_*.csv", "hkjc_full_season_*.csv"]
-
-all_files = []
-
-for pattern in search_patterns:
-
-    all_files.extend(glob.glob(pattern))
-
-
-
-if not all_files:
-
-    print("⚠️ 找不到歷史 CSV 檔案。")
-
-else:
-
-    print(f"📂 讀取 {len(all_files)} 個檔案中...")
-
-    df_list = []
-
-    for f in all_files:
-
-        try:
-
-            temp_df = pd.read_csv(f, encoding='utf-8-sig', on_bad_lines='skip')
-
-        except UnicodeDecodeError:
-
-            temp_df = pd.read_csv(f, encoding='cp950', on_bad_lines='skip')
-
-        df_list.append(temp_df)
-
-
-
-    df = pd.concat(df_list, ignore_index=True)
-
-
-
-    # 3. 資料清洗
-
-    df['獨贏賠率'] = pd.to_numeric(df['獨贏賠率'], errors='coerce')
-
-    df = df[(df['獨贏賠率'] > 1.0) & (df['名次'].notna())].copy()
-
-
-
-    # 🎯 核心改變 1：建立「排序權重 (Relevance)」
-
-    # 讓 AI 知道：贏馬最重要(3分)，第二名次之(2分)，第三名也有價值(1分)，落第(0分)
-
-    df['numeric_rank'] = pd.to_numeric(df['名次'], errors='coerce').fillna(99)
-
-    df['relevance'] = 0
-
-    df.loc[df['numeric_rank'] == 1, 'relevance'] = 3
-
-    df.loc[df['numeric_rank'] == 2, 'relevance'] = 2
-
-    df.loc[df['numeric_rank'] == 3, 'relevance'] = 1
-
-
-
-    # 計算基本特徵 (15大)
-
-    if '騎師' in df.columns:
-
-        jockey_stats = df.groupby('騎師', observed=False)['numeric_rank'].apply(lambda x: (x==1).mean()).reset_index(name='jockey_win_rate')
-
-        df = pd.merge(df, jockey_stats, on='騎師', how='left')
-
-    df['jockey_win_rate'] = df.get('jockey_win_rate', pd.Series(0.12, index=df.index)).fillna(0.12)
-
-
-
-    if '練馬師' in df.columns:
-
-        trainer_stats = df.groupby('練馬師', observed=False)['numeric_rank'].apply(lambda x: (x==1).mean()).reset_index(name='trainer_win_rate')
-
-        df = pd.merge(df, trainer_stats, on='練馬師', how='left')
-
-    df['trainer_win_rate'] = df.get('trainer_win_rate', pd.Series(0.12, index=df.index)).fillna(0.12)
-
-
-
-    df['combo_win_rate'] = (df['jockey_win_rate'] + df['trainer_win_rate']) / 2
-
-    df['horse_win_rate'] = 0.10
-
-    df['horse_last_rank'] = 6.0
-
-
-
-    if '馬名' in df.columns and '場地' in df.columns:
-
-        surface_stats = df.groupby(['馬名', '場地'], observed=False)['numeric_rank'].apply(lambda x: (x==1).mean()).reset_index(name='horse_surface_win_rate')
-
-        df = pd.merge(df, surface_stats, on=['馬名', '場地'], how='left')
-
-    df['horse_surface_win_rate'] = df.get('horse_surface_win_rate', pd.Series(0.08, index=df.index)).fillna(0.08)
-
-
-
-    if '馬名' in df.columns and '距離' in df.columns:
-
-        df['dist_group'] = pd.cut(df['距離'], bins=[0, 1200, 1600, 2400], labels=['短途', '中途', '長途'])
-
-        dist_stats = df.groupby(['馬名', 'dist_group'], observed=False)['numeric_rank'].apply(lambda x: (x==1).mean()).reset_index(name='horse_dist_win_rate')
-
-        df = pd.merge(df, dist_stats, on=['馬名', 'dist_group'], how='left')
-
-    df['horse_dist_win_rate'] = df.get('horse_dist_win_rate', pd.Series(0.08, index=df.index)).fillna(0.08)
-
-
-
-    df['market_prob'] = 1 / df['獨贏賠率']
-
-    prob_sum = df.groupby('賽事編號')['market_prob'].transform('sum')
-
-    df['market_implied_prob'] = df['market_prob'] / prob_sum
-
-
-
-    df['odds_rank'] = df.groupby('賽事編號')['獨贏賠率'].rank(method='min')
-
-    df['is_favorite'] = (df['odds_rank'] == 1).astype(int)
-
-    df['排位檔位'] = pd.to_numeric(df['排位檔位'], errors='coerce').fillna(7)
-
-
-
-    if '距離' not in df.columns: df['距離'] = 1200
-
-    df['實際負磅'] = pd.to_numeric(df.get('實際負磅', 120), errors='coerce').fillna(120.0)
-
-    avg_weight = df.groupby('賽事編號')['實際負磅'].transform('mean')
-
-    df['weight_diff'] = df['實際負磅'] - avg_weight
-
-    df['weight_rank'] = df.groupby('賽事編號')['實際負磅'].rank(ascending=False, method='min')
-
-
-
-    feature_cols = [
-
-        'market_implied_prob', '獨贏賠率', 'odds_rank', 'is_favorite',
-
-        '排位檔位', 'weight_diff', 'weight_rank',
-
-        'jockey_win_rate', 'trainer_win_rate', 'combo_win_rate',
-
-        'horse_win_rate', 'horse_last_rank',
-
-        '距離', 'horse_surface_win_rate', 'horse_dist_win_rate'
-
-    ]
-
-
-
-    for col in feature_cols:
-
-        if col not in df.columns: df[col] = 0.0
-
-
-
-    # 🎯 核心改變 2：絕對不能打亂賽事，必須以「整場比賽」為單位進行切割
-
-    unique_races = df['賽事編號'].unique()
-
-    train_races, val_races = train_test_split(unique_races, test_size=0.2, random_state=42)
-
-
-
-    # 將資料按照賽事編號嚴格排序 (LambdaRank 必備條件)
-
-    train_df = df[df['賽事編號'].isin(train_races)].sort_values('賽事編號')
-
-    val_df = df[df['賽事編號'].isin(val_races)].sort_values('賽事編號')
-
-
-
-    X_train = train_df[feature_cols]
-
-    y_train = train_df['relevance']
-
-    group_train = train_df.groupby('賽事編號').size().values  # 告訴 AI 每一場有幾匹馬
-
-
-
-    X_val = val_df[feature_cols]
-
-    y_val = val_df['relevance']
-
-    group_val = val_df.groupby('賽事編號').size().values
-
-
-
-    print(f"🚀 開始訓練【LambdaRank 模型】(訓練集包含 {len(train_races)} 場賽事)...")
-
-
-
-    # 🎯 核心改變 3：改用 LGBMRanker
-
-    model = lgb.LGBMRanker(
-
-        objective="lambdarank",
-
-        metric="ndcg",         # NDCG 是一種專門評估「排序準不準」的分數
-
-        n_estimators=300,
-
-        learning_rate=0.03,
-
-        max_depth=6,
-
-        random_state=42
-
-    )
-
-
-
-    model.fit(
-
-        X_train, y_train,
-
-        group=group_train,
-
-        eval_set=[(X_val, y_val)],
-
-        eval_group=[group_val],
-
-        callbacks=[lgb.early_stopping(stopping_rounds=25, verbose=False)]
-
-    )
-
-
-
-    print(f"\n📊 訓練大功告成！LambdaRank 的邏輯已建立。")
-
-
-
-    # 4. 儲存模型 (另存新檔，不覆蓋原本的分類模型)
-
-    model_filename = 'my_hkjc_ranker.pkl'
-
-    joblib.dump(model, model_filename)
-
-    print(f"\n💾 排序模型已成功儲存為：{model_filename}")
-
-
-
 import streamlit as st
-
 import pandas as pd
-
 import numpy as np
-
 import os
-
 import joblib
-
-
 
 # 頁面基本設定
-
 st.set_page_config(
-
-    page_title="HKJC LambdaRank 賽馬預測系統",
-
-    page_icon="🏆",
-
+    page_title="HKJC AI 智能賽馬預測系統",
+    page_icon="🐎",
     layout="wide"
-
 )
 
-
-
-st.title("🏆 HKJC LambdaRank 智能排序系統")
-
+st.title("🐎 HKJC 旗艦 15 大特徵 AI 預測系統")
 st.markdown("---")
 
-
-
-# 🎯 這裡改為讀取最新的排序模型
-
-MODEL_PATH = 'my_hkjc_ranker.pkl'
-
-
+# 設定模型路徑
+MODEL_PATH = 'my_hkjc_model.pkl'
 
 @st.cache_resource
-
 def load_model():
-
     if os.path.exists(MODEL_PATH):
-
         return joblib.load(MODEL_PATH)
-
     return None
-
-
 
 model = load_model()
 
-
-
 if model is None:
-
-    st.error(f"⚠️ 找不到 AI 模型檔 `{MODEL_PATH}`！請確認是否已成功生成。")
-
+    st.error(f"⚠️ 找不到 AI 模型檔 `{MODEL_PATH}`！請確認模型是否已上傳至正確目錄。")
     st.stop()
 
-
-
+# 側邊欄：檔案上傳區與參數設定
 st.sidebar.header("📂 資料載入")
-
 uploaded_file = st.sidebar.file_uploader("請上傳賽事資料 (CSV)", type=['csv'])
 
-
-
 st.sidebar.markdown("---")
-
-st.sidebar.header("⚙️ 投注策略參數")
-
-min_ev = st.sidebar.slider("最小期望值 (EV)", 0.0, 1.5, 0.0, 0.05)
-
+st.sidebar.header("⚙️ 投注策略參數設定")
+min_ev = st.sidebar.slider("最小期望值 (EV 門檻)", 0.0, 1.5, 0.0, 0.05)
 min_odds = st.sidebar.number_input("最低獨贏賠率", min_value=1.0, max_value=50.0, value=3.0)
-
-max_odds = st.sidebar.number_input("最高獨贏賠率", min_value=1.0, max_value=100.0, value=30.0)
-
-
+max_odds = st.sidebar.number_input("最高獨贏賠率", min_value=1.0, max_value=100.0, value=20.0)
 
 if uploaded_file is not None:
-
+    # 雙編碼容錯讀取
     try:
-
         df_raw = pd.read_csv(uploaded_file, encoding='utf-8-sig')
-
     except:
-
         uploaded_file.seek(0)
-
         df_raw = pd.read_csv(uploaded_file, encoding='cp950')
-
-
-
+        
     st.success("✅ 賽事資料載入成功！")
-
-
-
-    st.subheader("⚡ 快速輸入臨場賠率 (支援手機直接點擊修改)")
-
-    st.info("👇 點擊下方表格的『獨贏賠率』欄位即可修改數字。修改後，AI 會自動重新排序！")
-
-
-
-    edit_columns = ['賽事編號', '馬號', '馬名', '排位檔位', '獨贏賠率']
-
-    df_editable = df_raw[edit_columns].copy()
-
-
-
-    edited_df = st.data_editor(
-
-        df_editable,
-
-        disabled=['賽事編號', '馬號', '馬名', '排位檔位'],
-
-        use_container_width=True,
-
-        hide_index=True
-
-    )
-
-
-
+    
     df = df_raw.copy()
-
-    df['獨贏賠率'] = pd.to_numeric(edited_df['獨贏賠率'], errors='coerce').fillna(10.0)
-
-
-
+    
     # 1. 特徵工程
-
+    df['獨贏賠率'] = pd.to_numeric(df['獨贏賠率'], errors='coerce').fillna(10.0)
     df['market_prob'] = 1 / df['獨贏賠率']
-
     prob_sum = df.groupby('賽事編號')['market_prob'].transform('sum')
-
     df['market_implied_prob'] = df['market_prob'] / prob_sum
 
-
-
     df['odds_rank'] = df.groupby('賽事編號')['獨贏賠率'].rank(method='min')
-
     df['is_favorite'] = (df['odds_rank'] == 1).astype(int)
-
     df['排位檔位'] = pd.to_numeric(df['排位檔位'], errors='coerce').fillna(7)
 
-
-
     if '實際負磅' in df.columns:
-
         df['實際負磅'] = pd.to_numeric(df['實際負磅'], errors='coerce').fillna(120)
-
         avg_weight = df.groupby('賽事編號')['實際負磅'].transform('mean')
-
         df['weight_diff'] = df['實際負磅'] - avg_weight
-
         df['weight_rank'] = df.groupby('賽事編號')['實際負磅'].rank(ascending=False, method='min')
-
     else:
-
         df['weight_diff'] = 0.0
-
         df['weight_rank'] = 6.0
 
-
-
+    # 解析名次（用於回測判斷）
     df['numeric_rank'] = pd.to_numeric(df.get('名次', 99), errors='coerce').fillna(99)
 
     df['jockey_win_rate'] = df.get('jockey_win_rate', 0.12)
-
     df['trainer_win_rate'] = df.get('trainer_win_rate', 0.12)
-
     df['combo_win_rate'] = df.get('combo_win_rate', 0.10)
-
     df['horse_win_rate'] = df.get('horse_win_rate', 0.10)
-
     df['horse_last_rank'] = df.get('horse_last_rank', 6.0)
 
-
-
     if '距離' not in df.columns: df['距離'] = 1200
-
     if 'horse_surface_win_rate' not in df.columns: df['horse_surface_win_rate'] = 0.08
-
     if 'horse_dist_win_rate' not in df.columns: df['horse_dist_win_rate'] = 0.08
 
-
-
+    # 2. 提取 15 大特徵並預測勝率與 EV
     feature_cols = [
-
         'market_implied_prob', '獨贏賠率', 'odds_rank', 'is_favorite',
-
         '排位檔位', 'weight_diff', 'weight_rank',
-
         'jockey_win_rate', 'trainer_win_rate', 'combo_win_rate',
-
         'horse_win_rate', 'horse_last_rank',
-
         '距離', 'horse_surface_win_rate', 'horse_dist_win_rate'
-
     ]
 
-
-
     for col in feature_cols:
-
-        if col not in df.columns: df[col] = 0.0
-
-
+        if col not in df.columns:
+            df[col] = 0.0
 
     X_predict = df[feature_cols].fillna(0)
 
-
-
-    # 🎯 核心升級：使用 predict 取得 LambdaRank 的實力分數
-
-    df['raw_score'] = model.predict(X_predict)
-
-
-
-    # 🎯 將實力分數轉換為相對勝率 (Softmax 演算法)
-
-    def softmax(x):
-
-        e_x = np.exp(x - np.max(x))
-
-        return e_x / e_x.sum()
-
-
-
-    df['pred_win_prob'] = df.groupby('賽事編號')['raw_score'].transform(softmax)
-
-
-
-    # 計算 EV
-
+    df['pred_win_prob'] = model.predict_proba(X_predict)[:, 1]
     df['ev'] = df['pred_win_prob'] * df['獨贏賠率']
 
+    # ==========================================
+    # 建立雙分頁 UI (預測 vs 回測)
+    # ==========================================
+    tab1, tab2 = st.tabs(["🎯 各場次預測推薦", "📈 歷史回測 (ROI 統計)"])
 
-
-    st.markdown("---")
-
-    tab1, tab2 = st.tabs(["🎯 排序預測推薦", "📈 歷史回測 (ROI 統計)"])
-
-
-
+    # ---------------- 分頁 1: 賽前預測 ----------------
     with tab1:
-
-        st.subheader("🎯 LambdaRank 排序推薦清單")
-
-
+        st.subheader("🎯 各場次 AI 智慧投注推薦清單")
 
         recommendations = []
-
         for race_id, group in df.groupby('賽事編號'):
-
-            # 使用模型給出的分數 (raw_score) 或 EV 來排序
-
             filtered_group = group[(group['ev'] >= min_ev) & (group['獨贏賠率'] >= min_odds) & (group['獨贏賠率'] <= max_odds)]
-
-            sorted_group = filtered_group.sort_values(by='raw_score', ascending=False).reset_index(drop=True)
-
-
+            sorted_group = filtered_group.sort_values(by='ev', ascending=False).reset_index(drop=True)
 
             if len(sorted_group) >= 2:
-
                 top1 = sorted_group.iloc[0]
-
                 top2 = sorted_group.iloc[1]
-
                 top3 = sorted_group.iloc[2] if len(sorted_group) >= 3 else top2
 
-
-
-                win_pick = f"馬號 {top1['馬號']} ({top1['馬名']}) [相對勝率:{top1['pred_win_prob']*100:.1f}%, EV:{top1['ev']:.2f}]"
-
-                q_pick = f"{top1['馬號']} + {top2['馬號']}"
-
-                qp_pick = f"{top1['馬號']} + {top2['馬號']} / {top3['馬號']}"
-
-
+                win_pick = f"馬號 {top1['馬號']} ({top1['馬名']}) [勝率:{top1['pred_win_prob']*100:.1f}%, EV:{top1['ev']:.2f}]"
+                q_pick = f"{top1['馬號']} + {top2['馬號']} ({top1['馬名']} / {top2['馬名']})"
+                qp_pick = f"{top1['馬號']} + {top2['馬號']} 或 {top1['馬號']} + {top3['馬號']}"
 
                 recommendations.append({
-
                     '賽事編號': race_id,
-
-                    '🎯 首選獨贏': win_pick,
-
-                    '🔗 Q / QP': q_pick + " | " + qp_pick
-
+                    '🎯 獨贏推薦': win_pick,
+                    '🔗 連贏推薦 (Q)': q_pick,
+                    '🔗 位置Q推薦 (QP)': qp_pick
                 })
 
-
-
         rec_df = pd.DataFrame(recommendations)
-
         if rec_df.empty:
-
-            st.warning("⚠️ 沒有符合當前 EV 或賠率門檻的馬匹。")
-
+            st.warning("⚠️ 沒有符合當前篩選條件的馬匹，請試著放寬左側欄的 EV 或賠率限制。")
         else:
-
             st.dataframe(rec_df, use_container_width=True)
 
-
-
-        with tab2:
-
-        st.subheader("📊 排序模型策略回測結果 (詳細賽果明細)")
-
+    # ---------------- 分頁 2: 賽後回測 ----------------
+    with tab2:
+        st.subheader("📊 獨贏 (Win) 策略回測結果")
         
-
-        # 防呆檢查：確認有沒有真實名次
-
+        # 防呆檢查：確認上傳的檔案裡有沒有真實的「名次」數據
         if (df['numeric_rank'] == 99).all():
-
-            st.info("💡 目前上傳的資料沒有真實名次，無法計算 ROI。請上傳包含完賽名次的歷史資料檔來執行回測。")
-
+            st.warning("⚠️ 系統偵測到目前的 CSV 中沒有真實的『名次』紀錄 (或全部為空值)。請上傳已完賽並包含名次結果的歷史檔案來執行回測。")
         else:
-
             total_invested = 0
-
             total_return = 0
-
             bet_count = 0
-
             win_count = 0
-
             backtest_records = []
-
             
-
-            BET_AMOUNT = 100  # 每場固定投注 100 元
-
+            # 以每場 100 元為基準進行模擬
+            BET_AMOUNT = 100 
             
-
             for race_id, group in df.groupby('賽事編號'):
-
-                # 套用與預測相同的篩選條件
-
+                # 套用與預測完全相同的篩選條件
                 filtered_group = group[(group['ev'] >= min_ev) & (group['獨贏賠率'] >= min_odds) & (group['獨贏賠率'] <= max_odds)]
-
-                sorted_group = filtered_group.sort_values(by='raw_score', ascending=False).reset_index(drop=True)
-
+                sorted_group = filtered_group.sort_values(by='ev', ascending=False).reset_index(drop=True)
                 
-
-                # 如果這場有符合條件的馬，買進評分最高 (raw_score 最高) 的那一匹
-
+                # 如果這場有符合條件的馬，只買 EV 最高的「那一匹」獨贏
                 if len(sorted_group) > 0:
-
                     pick = sorted_group.iloc[0]
-
                     bet_count += 1
-
                     total_invested += BET_AMOUNT
-
                     
-
-                    # 檢查這匹馬實際名次是否為第 1 名
-
                     is_win = (pick['numeric_rank'] == 1)
-
-                    
-
                     if is_win:
-
                         win_count += 1
-
                         payout = BET_AMOUNT * pick['獨贏賠率']
-
                         total_return += payout
-
-                        result_str = "✅ 命中 (贏)"
-
+                        result_str = "✅ 贏"
                     else:
-
                         payout = 0
-
-                        result_str = "❌ 未命中 (輸)"
-
+                        result_str = "❌ 輸"
                         
-
-                    # 紀錄這一場的詳細表現
-
                     backtest_records.append({
-
                         '賽事編號': race_id,
-
-                        'AI 推薦馬號': f"馬號 {pick['馬號']} ({pick['馬名']})",
-
-                        '實際完賽名次': int(pick['numeric_rank']) if pick['numeric_rank'] != 99 else "未知",
-
+                        '投注馬號': f"{pick['馬號']} ({pick['馬名']})",
+                        '實際名次': str(pick['名次']).replace('.0', ''),
                         '獨贏賠率': pick['獨贏賠率'],
-
-                        '預測實力分': round(pick['raw_score'], 2),
-
-                        '投注結果': result_str,
-
-                        '派彩金額': f"${payout:.1f}",
-
+                        'EV': round(pick['ev'], 2),
+                        '結果': result_str,
+                        '派彩': f"${payout:.1f}",
                         '淨盈虧': f"${payout - BET_AMOUNT:.1f}"
-
                     })
-
             
-
+            # 統計與顯示區塊
             if bet_count > 0:
-
                 roi = ((total_return - total_invested) / total_invested) * 100
-
                 
-
-                # 頂部指標儀表板
-
+                # 使用 Streamlit 內建的 metric 元件來呈現儀表板質感
                 col1, col2, col3, col4 = st.columns(4)
-
-                col1.metric("回測投注場數", f"{bet_count} 場")
-
-                col2.metric("實際命中場數", f"{win_count} 場", f"勝率: {win_count/bet_count*100:.1f}%")
-
-                col3.metric("總投注成本", f"${total_invested}")
-
-                col4.metric("總回收金額", f"${total_return:.1f}", f"ROI: {roi:.2f}%")
-
+                col1.metric("投注場數", f"{bet_count} 場")
+                col2.metric("命中場數", f"{win_count} 場", f"勝率: {win_count/bet_count*100:.1f}%")
+                col3.metric("總投入成本", f"${total_invested}")
+                col4.metric("總回收 (含本金)", f"${total_return:.1f}", f"ROI: {roi:.2f}%")
                 
-
-                st.markdown("---")
-
-                st.markdown("#### 📝 每場賽事具體投注與命中明細")
-
-                
-
-                # 將明細轉成 DataFrame 並在畫面上完整呈現
-
-                res_df = pd.DataFrame(backtest_records)
-
-                st.dataframe(res_df, use_container_width=True)
-
-                
-
+                st.markdown("#### 📝 詳細投注明細")
+                st.dataframe(pd.DataFrame(backtest_records), use_container_width=True)
             else:
-
-                st.info("💡 在目前的 EV 和賠率篩選條件下，沒有任何場次符合出手標準。")
-
-
+                st.info("💡 在目前的 EV 和賠率設定下，本次回測沒有任何出手的場次。")
 
 else:
-
-    st.info("👈 請在左側上傳今日賽前排位表 CSV 以啟動預測！")
+    st.info("👈 請在左側上傳賽事 CSV 檔案來啟動系統！")
