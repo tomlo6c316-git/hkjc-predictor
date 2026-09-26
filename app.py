@@ -52,14 +52,15 @@ def fetch_live_odds(date_str, venue, race_no):
     try:
         resp = requests.get(url, headers=headers, timeout=5)
         # 馬會的資料通常包含像 '1=2.5=1.2;2=8.3=3.0' 這樣的結構 (馬號=獨贏=位置)
-        matches = re.findall(r'(\d+)=(\d+\.\d+|\d+)=(\d+\.\d+|\d+)', resp.text)
+        matches = re.findall(r'(\d+)=([0-9.]+)=([^;]*)', resp.text)
         if matches:
             odds_dict = {}
             for m in matches:
                 horse = str(m[0])
                 win = float(m[1])
-                place = float(m[2])
-                odds_dict[horse] = {'win': win, 'place': place}
+                odds_dict[horse] = {'win': win} 
+                except ValueError:
+                    continue # 萬一真的解析不出數字，跳過這匹馬，不影響整場
             return odds_dict
     except:
         pass
