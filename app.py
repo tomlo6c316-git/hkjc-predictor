@@ -43,32 +43,52 @@ min_odds = st.sidebar.number_input("最低獨贏賠率", min_value=1.0, max_valu
 max_odds = st.sidebar.number_input("最高獨贏賠率", min_value=1.0, max_value=100.0, value=20.0)
 
 # ==========================================
-# 🌟 新增功能 1：抓取馬會即時賠率的函數
-# ==========================================
-# ==========================================
-# 🌟 升級版：抓取馬會即時賠率 API (高容錯防呆版)
+# 🌟 偵錯與防封鎖版：抓取馬會即時賠率 API
 # ==========================================
 def fetch_live_odds(date_str, venue, race_no):
-    """攔截馬會即時賠率 JSON，相容隔夜盤與退出馬情況"""
+    """加入高強度偽裝 Header，並回傳原始字串以供偵錯"""
     url = f"https://bet.hkjc.com/racing/getJSON.aspx?type=winplaodds&date={date_str}&venue={venue}&raceno={race_no}"
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    
+    # 偽裝成真實的 Chrome 瀏覽器，加入 Referer 騙過防火牆
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'Referer': 'https://bet.hkjc.com/racing/pages/odds_wp.aspx?lang=ch',
+        'X-Requested-With': 'XMLHttpRequest'
+    }
+    
     try:
-        resp = requests.get(url, headers=headers, timeout=5)
-        # 放寬正則表達式：只強烈要求「獨贏」必須是數字，後面的「位置」就算出現 SCR 或空白也能順利放行
-        matches = re.findall(r'(\d+)=([0-9.]+)=([^;]*)', resp.text)
+        resp = requests.get(url, headers=headers, timeout=10)
+        raw_text = resp.text
+        
+        # 如果被防火牆擋下，通常會回傳 HTML 而不是 JSON 格式的賠率
+        if resp.status_code != 200:
+            return None, f"HTTP 錯誤碼: {resp.status_code}"
+            
+        matches = re.findall(r'(\d+)=([0-9.]+)=([^;]*)', raw_text)
         if matches:
             odds_dict = {}
             for m in matches:
                 horse = str(m[0])
                 try:
                     win = float(m[1])
-                    odds_dict[horse] = {'win': win} 
+                    place_str = str(m[2])
+                    
+                    # 容錯處理：如果有位置賠率就抓，沒有就預設 1.5
+                    try:
+                        place = float(place_str)
+                    except ValueError:
+                        place = 1.5
+                        
+                    odds_dict[horse] = {'win': win, 'place': place} 
                 except ValueError:
-                    continue # 萬一真的解析不出數字，跳過這匹馬，不影響整場
-            return odds_dict
-    except:
-        pass
-    return None
+                    continue
+            return odds_dict, raw_text
+        else:
+            return None, f"正則解析失敗。馬會回傳內容: {raw_text[:200]}"
+            
+    except Exception as e:
+        return None, f"連線發生異常: {str(e)}"
 
 if uploaded_file is not None:
     # 雙編碼容錯讀取
@@ -84,10 +104,7 @@ if uploaded_file is not None:
     if '位置賠率' not in df_raw.columns:
         df_raw['位置賠率'] = 1.0 + (pd.to_numeric(df_raw.get('獨贏賠率', 10.0), errors='coerce') - 1.0) / 3.2
 
-    # ==========================================
-    # 🌟 新增功能 2：使用 Session State 管理 DataFrame
-    # 這樣一鍵抓取賠率後，表格才不會被重置
-    # ==========================================
+    # 使用 Session State 管理 DataFrame
     if 'df_data' not in st.session_state or st.session_state.get('uploaded_filename') != uploaded_file.name:
         st.session_state['df_data'] = df_raw.copy()
         st.session_state['uploaded_filename'] = uploaded_file.name
@@ -99,7 +116,7 @@ if uploaded_file is not None:
     venue_input = col_v.selectbox("賽事場地", ["HV (跑馬地)", "ST (沙田)"])
     venue_code = "HV" if "HV" in venue_input else "ST"
     
-    # 自動從 CSV 第一筆資料萃取日期 (例如 20260923 -> 2026-09-23)
+    # 自動從 CSV 第一筆資料萃取日期
     sample_id = str(df_raw['賽事編號'].iloc[0])
     auto_date = f"{sample_id[:4]}-{sample_id[4:6]}-{sample_id[6:8]}" if len(sample_id) >= 8 else "2026-09-23"
     api_date = col_d.text_input("API 查詢日期", value=auto_date)
@@ -110,7 +127,7 @@ if uploaded_file is not None:
 
     if col_b.button("🔄 一鍵抓取該場最新賠率", use_container_width=True):
         with st.spinner(f"正在連線馬會抓取第 {target_race} 場即時賠率..."):
-            live_odds = fetch_live_odds(api_date, venue_code, target_race)
+            live_odds, debug_msg = fetch_live_odds(api_date, venue_code, target_race)
             
             if live_odds:
                 # 更新 Session State 中的 DataFrame
@@ -118,16 +135,17 @@ if uploaded_file is not None:
                 race_mask = df_temp['賽事編號'].str.endswith(f"-{target_race:02d}")
                 
                 for horse_no, odds in live_odds.items():
-                    horse_mask = race_mask & (df_temp['馬號'] == horse_no)
+                    horse_mask = race_mask & (df_temp['馬號'] == str(horse_no))
                     df_temp.loc[horse_mask, '獨贏賠率'] = odds['win']
                     df_temp.loc[horse_mask, '位置賠率'] = odds['place']
                 
                 st.session_state['df_data'] = df_temp
                 st.success(f"✅ 第 {target_race} 場賠率更新成功！")
                 time.sleep(1)
-                st.rerun() # 重新整理網頁，讓表格套用新數字
+                st.rerun() 
             else:
-                st.error("⚠️ 抓取失敗。可能是日期/場地錯誤，或馬會尚未開盤。")
+                # 將錯誤訊息直接印在畫面上
+                st.error(f"⚠️ 抓取失敗！詳細原因：{debug_msg}")
 
     # ==========================================
     # 互動式臨場賠率輸入面板 (綁定 Session State)
