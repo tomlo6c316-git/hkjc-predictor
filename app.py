@@ -45,20 +45,24 @@ max_odds = st.sidebar.number_input("最高獨贏賠率", min_value=1.0, max_valu
 # ==========================================
 # 🌟 新增功能 1：抓取馬會即時賠率的函數
 # ==========================================
+# ==========================================
+# 🌟 升級版：抓取馬會即時賠率 API (高容錯防呆版)
+# ==========================================
 def fetch_live_odds(date_str, venue, race_no):
-    """攔截馬會即時賠率 JSON，並用正則表達式萃取獨贏與位置賠率"""
+    """攔截馬會即時賠率 JSON，相容隔夜盤與退出馬情況"""
     url = f"https://bet.hkjc.com/racing/getJSON.aspx?type=winplaodds&date={date_str}&venue={venue}&raceno={race_no}"
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
         resp = requests.get(url, headers=headers, timeout=5)
-        # 馬會的資料通常包含像 '1=2.5=1.2;2=8.3=3.0' 這樣的結構 (馬號=獨贏=位置)
+        # 放寬正則表達式：只強烈要求「獨贏」必須是數字，後面的「位置」就算出現 SCR 或空白也能順利放行
         matches = re.findall(r'(\d+)=([0-9.]+)=([^;]*)', resp.text)
         if matches:
             odds_dict = {}
             for m in matches:
                 horse = str(m[0])
-                win = float(m[1])
-                odds_dict[horse] = {'win': win} 
+                try:
+                    win = float(m[1])
+                    odds_dict[horse] = {'win': win} 
                 except ValueError:
                     continue # 萬一真的解析不出數字，跳過這匹馬，不影響整場
             return odds_dict
