@@ -6,6 +6,8 @@ import joblib
 import requests
 import re
 import time
+from datetime import datetime
+from streamlit_autorefresh import st_autorefresh
 
 # 頁面基本設定
 st.set_page_config(
@@ -43,52 +45,132 @@ min_odds = st.sidebar.number_input("最低獨贏賠率", min_value=1.0, max_valu
 max_odds = st.sidebar.number_input("最高獨贏賠率", min_value=1.0, max_value=100.0, value=20.0)
 
 # ==========================================
-# 🌟 偵錯與防封鎖版：抓取馬會即時賠率 API
+# HKJC 新版 GraphQL：一次取得當日所有場次 WIN / PLACE 賠率
+# 查詢字串需保持原樣；這是網站使用的唯讀查詢，不會下注。
 # ==========================================
-def fetch_live_odds(date_str, venue, race_no):
-    """加入高強度偽裝 Header，並回傳原始字串以供偵錯"""
-    url = f"https://bet.hkjc.com/racing/getJSON.aspx?type=winplaodds&date={date_str}&venue={venue}&raceno={race_no}"
-    
-    # 偽裝成真實的 Chrome 瀏覽器，加入 Referer 騙過防火牆
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Referer': 'https://bet.hkjc.com/racing/pages/odds_wp.aspx?lang=ch',
-        'X-Requested-With': 'XMLHttpRequest'
+GRAPHQL_URL = "https://info.cld.hkjc.com/graphql/base/"
+ODDS_QUERY = """query racing($date: String, $venueCode: String, $oddsTypes: [OddsType], $raceNo: Int) {
+  raceMeetings(date: $date, venueCode: $venueCode) {
+    pmPools(oddsTypes: $oddsTypes, raceNo: $raceNo) {
+      id
+      status
+      sellStatus
+      oddsType
+      lastUpdateTime
+      guarantee
+      minTicketCost
+      name_en
+      name_ch
+      leg {
+        number
+        races
+      }
+      cWinSelections {
+        composite
+        name_ch
+        name_en
+        starters
+      }
+      oddsNodes {
+        combString
+        oddsValue
+        hotFavourite
+        oddsDropValue
+        bankerOdds {
+          combString
+          oddsValue
+        }
+      }
     }
-    
+  }
+}"""
+
+GRAPHQL_HEADERS = {
+    "Accept": "*/*",
+    "Content-Type": "application/json",
+    "Origin": "https://bet.hkjc.com",
+    "Referer": "https://bet.hkjc.com/",
+    "User-Agent": "Mozilla/5.0",
+}
+
+def normalize_horse_no(value):
+    """把 01、1、1.0 統一成字串 1，方便與 CSV 馬號比對。"""
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        raw_text = resp.text
-        
-        # 如果被防火牆擋下，通常會回傳 HTML 而不是 JSON 格式的賠率
-        if resp.status_code != 200:
-            return None, f"HTTP 錯誤碼: {resp.status_code}"
-            
-        matches = re.findall(r'(\d+)=([0-9.]+)=([^;]*)', raw_text)
-        if matches:
-            odds_dict = {}
-            for m in matches:
-                horse = str(m[0])
-                try:
-                    win = float(m[1])
-                    place_str = str(m[2])
-                    
-                    # 容錯處理：如果有位置賠率就抓，沒有就預設 1.5
-                    try:
-                        place = float(place_str)
-                    except ValueError:
-                        place = 1.5
-                        
-                    odds_dict[horse] = {'win': win, 'place': place} 
-                except ValueError:
-                    continue
-            return odds_dict, raw_text
-        else:
-            return None, f"正則解析失敗。馬會回傳內容: {raw_text[:200]}"
-            
-    except Exception as e:
-        return None, f"連線發生異常: {str(e)}"
+        return str(int(float(text)))
+    except (ValueError, TypeError):
+        return text
+
+
+def extract_race_no(value):
+    """由類似 20260927-01 的賽事編號提取場次。"""
+    match = re.search(r"-(\d+)\s*$", str(value).strip())
+    return int(match.group(1)) if match else None
+
+
+def fetch_live_odds(date_str, venue):
+    """一次抓取指定日期／場地所有場次的即時 WIN / PLACE 賠率。
+
+    回傳 (賠率資料, 最近更新時間, 錯誤訊息)。賠率資料格式：
+    {場次: {"WIN": {馬號: 賠率}, "PLA": {馬號: 賠率}}}
+    """
+    body = {
+        "operationName": "racing",
+        "variables": {
+            "date": date_str,
+            "venueCode": venue,
+            "raceNo": None,  # null 表示查詢該賽日所有場次
+            "oddsTypes": ["WIN", "PLA"],
+        },
+        "query": ODDS_QUERY,
+    }
+    try:
+        resp = requests.post(
+            GRAPHQL_URL,
+            headers=GRAPHQL_HEADERS,
+            json=body,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get("errors"):
+            return None, None, f"GraphQL 錯誤：{payload['errors']}"
+
+        meetings = (payload.get("data") or {}).get("raceMeetings") or []
+        if not meetings:
+            return None, None, "找不到該日期／場地的賽事資料。"
+
+        odds_by_race = {}
+        timestamps = []
+        for pool in meetings[0].get("pmPools") or []:
+            pool_type = str(pool.get("oddsType", "")).upper()
+            if pool_type not in ("WIN", "PLA"):
+                continue
+            if pool.get("lastUpdateTime"):
+                timestamps.append(pool["lastUpdateTime"])
+
+            race_numbers = (pool.get("leg") or {}).get("races") or []
+            for race_number in race_numbers:
+                race_number = int(race_number)
+                market = odds_by_race.setdefault(
+                    race_number, {"WIN": {}, "PLA": {}}
+                )
+                for node in pool.get("oddsNodes") or []:
+                    horse_no = normalize_horse_no(node.get("combString"))
+                    odds_value = node.get("oddsValue")
+                    if horse_no and odds_value not in (None, ""):
+                        market[pool_type][horse_no] = float(odds_value)
+
+        if not odds_by_race:
+            return None, None, "賽事有回應，但目前尚無可用 WIN／PLACE 賠率。"
+        return odds_by_race, (max(timestamps) if timestamps else None), None
+
+    except requests.RequestException as exc:
+        return None, None, f"連線錯誤：{exc}"
+    except (ValueError, TypeError, KeyError) as exc:
+        return None, None, f"解析回應錯誤：{exc}"
 
 if uploaded_file is not None:
     # 雙編碼容錯讀取
@@ -100,52 +182,96 @@ if uploaded_file is not None:
         
     st.success("✅ 賽事資料載入成功！")
     
-    # 確保原始資料有位置賠率欄位
+    # 確保賠率欄位存在；沒有實際 PLACE 賠率時以估算值作初始值
+    if '獨贏賠率' not in df_raw.columns:
+        df_raw['獨贏賠率'] = 10.0
     if '位置賠率' not in df_raw.columns:
-        df_raw['位置賠率'] = 1.0 + (pd.to_numeric(df_raw.get('獨贏賠率', 10.0), errors='coerce') - 1.0) / 3.2
+        win_values = pd.to_numeric(df_raw['獨贏賠率'], errors='coerce').fillna(10.0)
+        df_raw['位置賠率'] = 1.0 + (win_values - 1.0) / 3.2
 
-    # 使用 Session State 管理 DataFrame
+    # 使用 Session State 保留已抓取的賠率
     if 'df_data' not in st.session_state or st.session_state.get('uploaded_filename') != uploaded_file.name:
         st.session_state['df_data'] = df_raw.copy()
         st.session_state['uploaded_filename'] = uploaded_file.name
+        st.session_state['odds_editor_version'] = 0
 
     st.markdown("---")
     st.subheader("⚡ 臨場賠率更新中心")
-    
-    col_v, col_d, col_r, col_b = st.columns([1.5, 2, 1.5, 3])
-    venue_input = col_v.selectbox("賽事場地", ["HV (跑馬地)", "ST (沙田)"])
-    venue_code = "HV" if "HV" in venue_input else "ST"
-    
-    # 自動從 CSV 第一筆資料萃取日期
-    sample_id = str(df_raw['賽事編號'].iloc[0])
-    auto_date = f"{sample_id[:4]}-{sample_id[4:6]}-{sample_id[6:8]}" if len(sample_id) >= 8 else "2026-09-23"
-    api_date = col_d.text_input("API 查詢日期", value=auto_date)
-    
-    # 自動抓取 CSV 中包含的場次
-    races_available = sorted(list(set([int(str(x).split('-')[1]) for x in df_raw['賽事編號']])))
-    target_race = col_r.selectbox("更新場次", races_available)
 
-    if col_b.button("🔄 一鍵抓取該場最新賠率", use_container_width=True):
-        with st.spinner(f"正在連線馬會抓取第 {target_race} 場即時賠率..."):
-            live_odds, debug_msg = fetch_live_odds(api_date, venue_code, target_race)
-            
-            if live_odds:
-                # 更新 Session State 中的 DataFrame
-                df_temp = st.session_state['df_data']
-                race_mask = df_temp['賽事編號'].str.endswith(f"-{target_race:02d}")
-                
-                for horse_no, odds in live_odds.items():
-                    horse_mask = race_mask & (df_temp['馬號'] == str(horse_no))
-                    df_temp.loc[horse_mask, '獨贏賠率'] = odds['win']
-                    df_temp.loc[horse_mask, '位置賠率'] = odds['place']
-                
-                st.session_state['df_data'] = df_temp
-                st.success(f"✅ 第 {target_race} 場賠率更新成功！")
-                time.sleep(1)
-                st.rerun() 
-            else:
-                # 將錯誤訊息直接印在畫面上
-                st.error(f"⚠️ 抓取失敗！詳細原因：{debug_msg}")
+    col_v, col_d, col_r = st.columns([1.5, 2, 1.5])
+    venue_input = col_v.selectbox("賽事場地", ["HV (跑馬地)", "ST (沙田)"])
+    venue_code = "HV" if venue_input.startswith("HV") else "ST"
+
+    # 從賽事編號取日期（例如 20260927-01）；格式為 YYYY-MM-DD
+    sample_id = str(df_raw['賽事編號'].iloc[0]).strip() if len(df_raw) else ""
+    date_match = re.search(r"(20\d{6})", sample_id)
+    if date_match:
+        raw_date = date_match.group(1)
+        auto_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
+    else:
+        auto_date = datetime.now().strftime("%Y-%m-%d")
+    api_date = col_d.text_input("API 查詢日期 (YYYY-MM-DD)", value=auto_date)
+
+    race_series = df_raw['賽事編號'].map(extract_race_no)
+    races_available = sorted(int(x) for x in race_series.dropna().unique())
+    if races_available:
+        target_race = col_r.selectbox("查看場次", races_available)
+    else:
+        target_race = col_r.number_input("查看場次", min_value=1, max_value=15, value=1, step=1)
+
+    auto_col, interval_col, button_col = st.columns([1.5, 1.5, 2.5])
+    auto_refresh = auto_col.checkbox("自動更新全部場次", value=False)
+    refresh_seconds = interval_col.selectbox(
+        "更新間隔（秒）", [30, 60, 120, 300], index=1, disabled=not auto_refresh
+    )
+    manual_refresh = button_col.button(
+        "🔄 立即更新全部場次賠率", use_container_width=True
+    )
+
+    if auto_refresh:
+        st_autorefresh(
+            interval=int(refresh_seconds * 1000),
+            key="hkjc_live_odds_autorefresh",
+        )
+
+    if auto_refresh or manual_refresh:
+        with st.spinner("正在讀取當日所有場次的 WIN／PLACE 即時賠率…"):
+            live_by_race, server_updated_at, error = fetch_live_odds(api_date, venue_code)
+
+        if live_by_race:
+            df_temp = st.session_state['df_data'].copy()
+            row_races = df_temp['賽事編號'].map(extract_race_no)
+            row_horses = df_temp['馬號'].map(normalize_horse_no)
+            updated_rows = 0
+
+            for race_no, markets in live_by_race.items():
+                race_mask = row_races == int(race_no)
+                for horse_no, value in markets['WIN'].items():
+                    horse_mask = race_mask & (row_horses == horse_no)
+                    updated_rows += int(horse_mask.sum())
+                    df_temp.loc[horse_mask, '獨贏賠率'] = value
+                for horse_no, value in markets['PLA'].items():
+                    horse_mask = race_mask & (row_horses == horse_no)
+                    df_temp.loc[horse_mask, '位置賠率'] = value
+
+            st.session_state['df_data'] = df_temp
+            st.session_state['odds_editor_version'] = st.session_state.get('odds_editor_version', 0) + 1
+            st.session_state['odds_last_status'] = (
+                f"成功取得 {len(live_by_race)} 場賠率；更新到 CSV 的馬匹資料列：{updated_rows}。"
+            )
+            st.session_state['odds_server_time'] = server_updated_at
+            st.session_state['odds_last_error'] = None
+        else:
+            st.session_state['odds_last_error'] = error
+
+    if st.session_state.get('odds_last_error'):
+        st.warning(st.session_state['odds_last_error'])
+    elif st.session_state.get('odds_last_status'):
+        st.success(st.session_state['odds_last_status'])
+        if st.session_state.get('odds_server_time'):
+            st.caption(f"馬會資料最後更新時間：{st.session_state['odds_server_time']}")
+    if auto_refresh:
+        st.caption(f"自動刷新已開啟，每 {refresh_seconds} 秒查詢一次；每次僅送出一個唯讀請求。")
 
     # ==========================================
     # 互動式臨場賠率輸入面板 (綁定 Session State)
@@ -159,7 +285,8 @@ if uploaded_file is not None:
         df_editable,
         disabled=['賽事編號', '馬號', '馬名', '排位檔位'], 
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
+        key=f"odds_editor_{st.session_state.get('odds_editor_version', 0)}"
     )
     
     # 將手動編輯或 API 抓取的結果套用到主要 DataFrame
@@ -185,7 +312,8 @@ if uploaded_file is not None:
         df['weight_diff'] = 0.0
         df['weight_rank'] = 6.0
 
-    df['numeric_rank'] = pd.to_numeric(df.get('名次', 99), errors='coerce').fillna(99)
+    rank_source = df['名次'] if '名次' in df.columns else pd.Series(99, index=df.index)
+    df['numeric_rank'] = pd.to_numeric(rank_source, errors='coerce').fillna(99)
 
     df['jockey_win_rate'] = df.get('jockey_win_rate', 0.12)
     df['trainer_win_rate'] = df.get('trainer_win_rate', 0.12)
