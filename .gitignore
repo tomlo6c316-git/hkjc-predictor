@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.pkl
+*.joblib
+*.csv
+*.json
+.streamlit/secrets.toml
