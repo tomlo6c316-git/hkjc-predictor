@@ -38,8 +38,8 @@ README.md
 
 ### 3. 回測與 ROI
 
-- 上傳已完成賽事的 enriched CSV。
-- 使用按賽日排序的 Train／Validation／Test；最後一段日期只用作未見 Test，不參與 early stopping 或擬合。
+- **指定賽日快速回測**：上傳已保存的 `backtest_predictions_19feature.csv`（需含 `model_win_probability` 及 `target_win`／`名次`），選日期後只計算該日，不重新訓練。例如檢查2026-10-01，選 `2026-10-01`。
+- **完整時間切分回測**：上傳已完成賽事的 enriched CSV；使用按賽日排序的 Train／Validation／Test，最後一段日期只用作未見 Test，不參與 early stopping 或擬合。
 - 比較模型每場最高分馬與市場熱門的概率指標及固定每場獨贏投注 ROI。
 - 每場投注金額預設 HK$10，可在介面調整；程式以 CSV 的獨贏賠率估算回報，不是官方派彩結算。
 - 下載 Test 逐馬預測、逐場ROI明細和 JSON 指標。
