@@ -328,6 +328,157 @@ def top1_roi(predictions: pd.DataFrame, stake_per_race: float = 10.0) -> tuple[d
     return summary, race_report
 
 
+def place_top3_backtest(
+    predictions: pd.DataFrame,
+    stake_per_bet: float = 10.0,
+    rank_col: str | None = None,
+    withdrawn_col: str | None = None,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """Backtest three model/market PLACE selections per eligible local race.
+
+    HKJC local Place qualification: 1st/2nd for 4-6 starters and 1st-3rd
+    for 7+ starters. Each selected horse is treated as a separate equal stake.
+    Withdrawn selections are refunded and are not replaced by the next-ranked
+    runner. Place ROI is only estimated when every non-void ticket has a valid
+    saved PLACE quote; it is not official pari-mutuel settlement.
+    """
+    required = ["賽事編號", "馬號", "model_win_probability"]
+    missing = [col for col in required if col not in predictions.columns]
+    if missing:
+        raise ValueError(f"PLACE回測缺少必要欄位：{missing}")
+    if stake_per_bet <= 0:
+        raise ValueError("每注PLACE投注金額必須大於0。")
+
+    frame = predictions.copy()
+    if rank_col is None:
+        rank_col = next((c for c in ["官方名次", "名次", "numeric_rank", "official_rank"] if c in frame.columns), None)
+    if rank_col is None:
+        # A target_win-only file cannot establish 2nd/3rd-place outcomes.
+        empty = {
+            "PLACE有效賽事數": 0, "PLACE略過賽事數": int(frame["賽事編號"].nunique()),
+            "PLACE模型選中注數": 0, "PLACE模型命中注數": 0, "PLACE模型注命中率": None,
+            "PLACE模型至少中一匹場數": 0, "PLACE模型場命中率": None,
+            "PLACE模型總投注": 0.0, "PLACE模型估算總派彩": None,
+            "PLACE模型淨盈虧": None, "PLACE模型ROI": None,
+            "PLACE市場選中注數": 0, "PLACE市場命中注數": 0, "PLACE市場注命中率": None,
+            "PLACE市場至少中一匹場數": 0, "PLACE市場場命中率": None,
+            "PLACE市場總投注": 0.0, "PLACE市場估算總派彩": None,
+            "PLACE市場淨盈虧": None, "PLACE市場ROI": None,
+            "PLACE缺少有效位置賠率注數": 0,
+            "PLACE狀態": "CSV沒有官方名次；只有target_win無法計算PLACE名次命中。",
+        }
+        return empty, pd.DataFrame()
+
+    place_odds_col = next((c for c in ["位置賠率", "PLACE賠率", "place_odds", "place_odds_decimal"] if c in frame.columns), None)
+    if withdrawn_col is None:
+        withdrawn_col = next((c for c in ["__withdrawn", "退出", "退賽", "狀態", "馬匹狀態", "賽果狀態"] if c in frame.columns), None)
+
+    rank_text = frame[rank_col].astype("string").fillna("").str.strip()
+    frame["__place_rank"] = pd.to_numeric(rank_text.str.extract(r"^\s*(\d+)", expand=False), errors="coerce")
+    if withdrawn_col and withdrawn_col in frame.columns:
+        status = frame[withdrawn_col]
+        if pd.api.types.is_bool_dtype(status):
+            frame["__place_withdrawn"] = status.fillna(False).astype(bool)
+        else:
+            status_text = status.astype("string").fillna("")
+            frame["__place_withdrawn"] = status_text.str.contains(r"退出|退賽|scratched|withdrawn", case=False, regex=True, na=False)
+    else:
+        frame["__place_withdrawn"] = False
+
+    frame["__place_score_model"] = pd.to_numeric(frame["model_win_probability"], errors="coerce")
+    if "market_implied_prob" in frame.columns:
+        frame["__place_score_market"] = pd.to_numeric(frame["market_implied_prob"], errors="coerce")
+    else:
+        odds = pd.to_numeric(frame.get("獨贏賠率", pd.Series(np.nan, index=frame.index)), errors="coerce")
+        inverse = 1.0 / odds.where(odds.gt(1.0))
+        denominator = inverse.groupby(frame["賽事編號"], observed=True).transform("sum")
+        frame["__place_score_market"] = inverse / denominator
+
+    if frame[["__place_score_model", "__place_score_market"]].isna().any().any():
+        raise ValueError("PLACE回測的模型／市場排序分數有缺值，無法公平選取前三匹。")
+    if place_odds_col:
+        frame["__place_odds"] = pd.to_numeric(frame[place_odds_col], errors="coerce")
+    else:
+        frame["__place_odds"] = np.nan
+
+    ticket_rows: list[dict[str, Any]] = []
+    race_count = 0
+    skipped = 0
+    for race_id, race in frame.groupby("賽事編號", observed=True, sort=False):
+        starters = race.loc[~race["__place_withdrawn"]]
+        starter_count = int(len(starters))
+        if starter_count < 4 or starters["__place_rank"].notna().sum() == 0:
+            skipped += 1
+            continue
+        qualifying_places = 2 if starter_count <= 6 else 3
+        race_count += 1
+        for strategy, score_col in [("模型", "__place_score_model"), ("市場", "__place_score_market")]:
+            # Choose from the recorded card first. If a selected horse was later
+            # scratched, its own ticket is void; do not silently replace it.
+            picks = race.sort_values([score_col, "馬號"], ascending=[False, True], kind="stable").head(3)
+            for selection_order, (_, row) in enumerate(picks.iterrows(), start=1):
+                is_void = bool(row["__place_withdrawn"])
+                rank = row["__place_rank"]
+                hit = bool(pd.notna(rank) and int(rank) <= qualifying_places) and not is_void
+                ticket_rows.append({
+                    "賽事編號": race_id, "策略": f"PLACE-{strategy}前三",
+                    "選擇次序": selection_order, "馬號": row["馬號"], "馬名": row.get("馬名", ""),
+                    "官方名次": rank if pd.notna(rank) else row.get(rank_col, ""),
+                    "該場合資格得位數": qualifying_places, "是否得位": int(hit),
+                    "是否退出／作廢": is_void,
+                    "位置賠率": row["__place_odds"],
+                    "估算投注": 0.0 if is_void else float(stake_per_bet),
+                    "估算派彩": (
+                        0.0 if is_void or not hit else
+                        (float(stake_per_bet) * float(row["__place_odds"])
+                         if pd.notna(row["__place_odds"]) and row["__place_odds"] > 1 else np.nan)
+                    ),
+                    "模型分數": row["__place_score_model"], "市場分數": row["__place_score_market"],
+                })
+
+    details = pd.DataFrame(ticket_rows)
+    results: dict[str, Any] = {"PLACE有效賽事數": race_count, "PLACE略過賽事數": skipped}
+    for strategy, prefix in [("模型", "PLACE模型"), ("市場", "PLACE市場")]:
+        part = details.loc[details["策略"].eq(f"PLACE-{strategy}前三")].copy() if not details.empty else pd.DataFrame()
+        if part.empty:
+            results.update({f"{prefix}選中注數": 0, f"{prefix}命中注數": 0, f"{prefix}注命中率": None,
+                            f"{prefix}至少中一匹場數": 0, f"{prefix}場命中率": None,
+                            f"{prefix}總投注": 0.0, f"{prefix}估算總派彩": None,
+                            f"{prefix}淨盈虧": None, f"{prefix}ROI": None})
+            continue
+        valid_tickets = part.loc[~part["是否退出／作廢"]]
+        hit_count = int(valid_tickets["是否得位"].sum())
+        race_hits = int(valid_tickets.groupby("賽事編號")["是否得位"].max().sum())
+        missing_quotes = int((valid_tickets["位置賠率"].isna() | valid_tickets["位置賠率"].le(1.0)).sum())
+        total_stake = float(valid_tickets["估算投注"].sum())
+        if missing_quotes:
+            total_return = profit = roi = None
+            state = f"缺少{missing_quotes}注有效位置賠率；保留命中統計，但不計部分ROI。"
+        else:
+            total_return = float(valid_tickets["估算派彩"].sum())
+            profit = total_return - total_stake
+            roi = profit / total_stake if total_stake else 0.0
+            state = "位置賠率估算派彩；非HKJC官方結算派彩。"
+        results.update({
+            f"{prefix}選中注數": int(len(valid_tickets)),
+            f"{prefix}命中注數": hit_count,
+            f"{prefix}注命中率": hit_count / len(valid_tickets) if len(valid_tickets) else 0.0,
+            f"{prefix}至少中一匹場數": race_hits,
+            f"{prefix}場命中率": race_hits / race_count if race_count else 0.0,
+            f"{prefix}總投注": total_stake,
+            f"{prefix}估算總派彩": total_return,
+            f"{prefix}淨盈虧": profit,
+            f"{prefix}ROI": roi,
+        })
+        if strategy == "模型":
+            results["PLACE缺少有效位置賠率注數"] = missing_quotes
+            results["PLACE狀態"] = state
+        else:
+            results["PLACE市場缺少有效位置賠率注數"] = missing_quotes
+            results["PLACE市場狀態"] = state
+    return results, details
+
+
 def train_full_model(raw: pd.DataFrame) -> tuple[Any, pd.DataFrame, dict[str, Any]]:
     """Choose iteration on validation data, then refit on all labelled rows."""
     frame = prepare_training_data(raw)
@@ -348,8 +499,12 @@ def train_full_model(raw: pd.DataFrame) -> tuple[Any, pd.DataFrame, dict[str, An
     return model, frame, info
 
 
-def chronological_backtest(raw: pd.DataFrame, stake_per_race: float = 10.0) -> dict[str, Any]:
-    """Evaluate a model on the untouched final date block and calculate top-1 ROI."""
+def chronological_backtest(
+    raw: pd.DataFrame,
+    stake_per_race: float = 10.0,
+    stake_per_place_bet: float | None = None,
+) -> dict[str, Any]:
+    """Evaluate an untouched chronological test block for WIN and PLACE."""
     frame = prepare_training_data(raw)
     masks, train_cut, val_cut = trainer.chronological_masks(frame)
     train = frame.loc[masks["train"]].copy()
@@ -358,11 +513,14 @@ def chronological_backtest(raw: pd.DataFrame, stake_per_race: float = 10.0) -> d
     best_iteration = _fit_iteration(train, validation)
     model = _fit_model(pd.concat([train, validation], axis=0).sort_values(["_race_date", "賽事編號", "馬號"]), best_iteration)
     probabilities = _prob_for_win(model, test[FEATURE_COLS])
-    predicted = test[[c for c in ["賽事編號", "馬季", "馬號", "馬名", "名次", "target_win", "獨贏賠率", "market_implied_prob"] if c in test.columns]].copy()
+    predicted = test[[c for c in ["賽事編號", "馬季", "馬號", "馬名", "名次", "target_win", "獨贏賠率", "位置賠率", "market_implied_prob"] if c in test.columns]].copy()
     predicted["model_win_probability"] = probabilities
     predicted["model_rank"] = predicted.groupby("賽事編號", observed=True)["model_win_probability"].rank(ascending=False, method="min")
     predicted["market_rank"] = predicted.groupby("賽事編號", observed=True)["market_implied_prob"].rank(ascending=False, method="min")
     roi_summary, race_details = top1_roi(predicted, stake_per_race)
+    place_summary, place_details = place_top3_backtest(
+        predicted, stake_per_bet=stake_per_place_bet if stake_per_place_bet is not None else stake_per_race
+    )
     metrics = {
         "切分": {
             "Train賽日數": int(train["_race_date"].nunique()),
@@ -378,8 +536,10 @@ def chronological_backtest(raw: pd.DataFrame, stake_per_race: float = 10.0) -> d
         "市場概率指標": _probability_metrics(test["target_win"].to_numpy(), test["market_implied_prob"].to_numpy()),
         "最佳迭代次數": best_iteration,
         "ROI": roi_summary,
+        "PLACE": place_summary,
     }
-    return {"metrics": metrics, "predictions": predicted, "race_details": race_details, "model": model}
+    return {"metrics": metrics, "predictions": predicted, "race_details": race_details,
+            "place_details": place_details, "model": model}
 
 
 def predict_racecard(raw: pd.DataFrame, model: Any) -> pd.DataFrame:
@@ -415,7 +575,8 @@ def single_date_backtest(
     saved_predictions: pd.DataFrame,
     target_date: str,
     stake_per_race: float = 10.0,
-) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
+    stake_per_place_bet: float | None = None,
+) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Evaluate one meeting from saved out-of-sample predictions, without refitting."""
     required = ["賽事編號", "馬號", "model_win_probability", "獨贏賠率"]
     missing = [col for col in required if col not in saved_predictions.columns]
@@ -430,9 +591,11 @@ def single_date_backtest(
     if "target_win" not in selected.columns:
         if "名次" not in selected.columns:
             raise ValueError("CSV 必須包含 target_win 或官方名次欄，才能核對賽果。")
-        selected["target_win"] = (
-            pd.to_numeric(selected["名次"], errors="coerce").eq(1).astype(int)
+        rank_number = pd.to_numeric(
+            selected["名次"].astype("string").str.extract(r"^\s*(\d+)", expand=False),
+            errors="coerce",
         )
+        selected["target_win"] = rank_number.eq(1).astype(int)
     if "market_implied_prob" not in selected.columns:
         odds = pd.to_numeric(selected["獨贏賠率"], errors="coerce")
         if odds.isna().any() or (odds <= 1).any():
@@ -445,6 +608,9 @@ def single_date_backtest(
     selected["賽事編號"] = selected["賽事編號"].astype(str).str.strip()
 
     summary_roi, details = top1_roi(selected, stake_per_race)
+    place_summary, place_details = place_top3_backtest(
+        selected, stake_per_bet=stake_per_place_bet if stake_per_place_bet is not None else stake_per_race
+    )
     y = pd.to_numeric(selected["target_win"], errors="coerce").fillna(0).to_numpy(dtype=int)
     model_p = pd.to_numeric(selected["model_win_probability"], errors="coerce").to_numpy(dtype=float)
     market_p = pd.to_numeric(selected["market_implied_prob"], errors="coerce").to_numpy(dtype=float)
@@ -453,10 +619,11 @@ def single_date_backtest(
         "賽事數": int(selected["賽事編號"].nunique()),
         "馬匹數": int(len(selected)),
         "ROI": summary_roi,
+        "PLACE": place_summary,
         "模型概率指標": _probability_metrics(y, model_p),
         "市場概率指標": _probability_metrics(y, market_p),
     }
-    return metrics, details, selected
+    return metrics, details, selected, place_details
 
 
 def backtest_prediction_snapshot(
@@ -464,7 +631,8 @@ def backtest_prediction_snapshot(
     official_results: pd.DataFrame,
     snapshot_id: str | None = None,
     stake_per_race: float = 10.0,
-) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
+    stake_per_place_bet: float | None = None,
+) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Join one saved pre-race prediction/odds snapshot to official results.
 
     Snapshot prices are the quotes recorded at snapshot time, not official
@@ -552,6 +720,15 @@ def backtest_prediction_snapshot(
     if "馬名" not in active.columns:
         active["馬名"] = ""
     summary, details = top1_roi(active, stake_per_race)
+    # Preserve original selections before scratches are removed from WIN picks;
+    # a PLACE bet on a scratched runner is void, not replaced by rank four.
+    place_summary, place_details = place_top3_backtest(
+        merged,
+        stake_per_bet=stake_per_place_bet if stake_per_place_bet is not None else stake_per_race,
+        rank_col="官方名次" if "官方名次" in merged.columns else "名次",
+        withdrawn_col="__withdrawn",
+    )
+    summary["PLACE"] = place_summary
     details["賽前快照ID"] = snapshot_id or "單一快照"
     if "賽前快照時間(HKT)" in active.columns:
         times = active["賽前快照時間(HKT)"].dropna().astype(str).unique().tolist()
@@ -560,4 +737,4 @@ def backtest_prediction_snapshot(
     summary["退出／退賽馬匹略過數"] = withdrawn_count
     summary["選取快照ID"] = snapshot_id or "單一快照"
     selected = active.drop(columns="__withdrawn", errors="ignore")
-    return summary, details, selected
+    return summary, details, selected, place_details

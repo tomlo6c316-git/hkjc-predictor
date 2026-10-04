@@ -1,7 +1,4 @@
 __pycache__/
-*.py[cod]
-.venv/
-venv/
 .env
 *.pkl
 *.joblib
