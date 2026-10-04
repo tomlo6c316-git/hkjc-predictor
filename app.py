@@ -87,6 +87,20 @@ def _append_pre_race_snapshot(prediction: pd.DataFrame, metadata: dict) -> str:
     return snapshot_id
 
 
+def _race_options(frame: pd.DataFrame) -> list[str]:
+    if "賽事編號" not in frame.columns:
+        return []
+    return sorted(frame["賽事編號"].dropna().astype(str).unique().tolist())
+
+
+def _race_label(race_id: str) -> str:
+    text = str(race_id)
+    suffix = text.rsplit("-", 1)[-1]
+    if suffix.isdigit():
+        return f"第 {int(suffix)} 場（{text}）"
+    return text
+
+
 def _render_place_results(summary: dict, details: pd.DataFrame, key: str) -> None:
     """Show model/market top-three Place backtest results and detailed tickets."""
     st.markdown("#### 位置（PLACE）前三選馬回測")
@@ -199,7 +213,7 @@ with predict_tab:
     )
     future_venue = st.selectbox("馬場", ["ST", "HV"], format_func=lambda value: "沙田（ST）" if value == "ST" else "跑馬地（HV）", key="futurecard_venue")
     if st.button("抓取排位並產生19大 prediction CSV", type="primary", key="fetch_futurecard_button"):
-        for state_key in ["hkjc19_futurecard_csv", "hkjc19_futurecard_prediction", "hkjc19_futurecard_meta", "hkjc19_futurecard_file_name"]:
+        for state_key in ["hkjc19_futurecard_csv", "hkjc19_futurecard_prediction", "hkjc19_futurecard_meta", "hkjc19_futurecard_file_name", "futurecard_focused_race"]:
             st.session_state.pop(state_key, None)
         if history_file is None:
             st.error("請先上傳歷史 enriched CSV，否則不能安全計算19大過去賽績特徵。")
@@ -254,6 +268,18 @@ with predict_tab:
                     st.session_state["hkjc19_odds_refresh_error"] = str(exc)
                     st.session_state["hkjc19_odds_refresh_last_attempt"] = time.time()
 
+            saved_prediction = st.session_state.get("hkjc19_futurecard_prediction")
+            focused_prediction = saved_prediction
+            if saved_prediction is not None:
+                race_options = _race_options(saved_prediction)
+                if race_options:
+                    selected_race = st.selectbox("固定查看場次（更新後仍留在此場）", race_options,
+                                                 format_func=_race_label, key="futurecard_focused_race")
+                    focused_prediction = saved_prediction.loc[
+                        saved_prediction["賽事編號"].astype(str).eq(str(selected_race))
+                    ].copy()
+                    st.caption(f"目前聚焦：{_race_label(selected_race)}；更新不會切回第一場。下載仍包含全日場次。")
+
             current_card = st.session_state.get("hkjc19_futurecard_csv")
             metadata = st.session_state.get("hkjc19_futurecard_meta", {})
             odds_label = metadata.get("odds_time") or "HKJC 未提供更新時間"
@@ -273,11 +299,10 @@ with predict_tab:
             no_prior_race = pd.to_numeric(current_card["days_since_last_race"], errors="coerce").eq(999.0)
             no_same_course = pd.to_numeric(current_card["horse_course_starts"], errors="coerce").eq(0.0)
             st.caption(f"歷史資料檢查：沒有可用舊賽紀錄 {int(no_prior_race.sum())} 匹；沒有同場地／路程歷史出賽 {int(no_same_course.sum())} 匹。這兩項使用訓練流程的預設值。")
-            saved_prediction = st.session_state.get("hkjc19_futurecard_prediction")
             if saved_prediction is not None:
                 st.markdown("#### 目前模型排序（如有載入19大模型）")
-                prediction_cols = [c for c in ["賽事編號", "馬號", "馬名", "獨贏賠率", "model_win_probability", "model_race_probability", "model_rank"] if c in saved_prediction.columns]
-                st.dataframe(saved_prediction[prediction_cols], use_container_width=True, hide_index=True)
+                prediction_cols = [c for c in ["賽事編號", "馬號", "馬名", "獨贏賠率", "位置賠率", "model_win_probability", "model_race_probability", "model_rank"] if c in focused_prediction.columns]
+                st.dataframe(focused_prediction[prediction_cols], use_container_width=True, hide_index=True, height=320)
                 st.download_button(
                     "下載含最新賠率及模型排序的 CSV",
                     data=saved_prediction.to_csv(index=False).encode("utf-8-sig"),
@@ -314,6 +339,7 @@ with predict_tab:
         try:
             race_raw = read_csv_bytes(race_file.getvalue())
             predicted = predict_racecard(race_raw, active_model)
+            st.session_state.pop("uploaded_focused_race", None)
             st.session_state["hkjc19_last_prediction_card"] = race_raw.copy()
             st.session_state["hkjc19_last_prediction"] = predicted
             st.session_state["hkjc19_last_prediction_name"] = f"{race_file.name.rsplit('.', 1)[0]}_predicted.csv"
@@ -358,8 +384,18 @@ with predict_tab:
             if current_prediction is None:
                 st.error("目前沒有已預測賽卡；請重新上傳並按開始預測。")
                 return
-            show_cols = [c for c in ["賽事編號", "馬號", "馬名", "獨贏賠率", "model_win_probability", "model_race_probability", "model_rank"] if c in current_prediction.columns]
-            st.dataframe(current_prediction[show_cols], use_container_width=True, hide_index=True)
+            race_options = _race_options(current_prediction)
+            if race_options:
+                selected_race = st.selectbox("固定查看場次（賠率更新後維持此場）", race_options,
+                                             format_func=_race_label, key="uploaded_focused_race")
+                focused_prediction = current_prediction.loc[
+                    current_prediction["賽事編號"].astype(str).eq(str(selected_race))
+                ].copy()
+                st.caption(f"目前聚焦：{_race_label(selected_race)}。自動刷新會保留此場；下載CSV仍包含全日所有場次。")
+            else:
+                focused_prediction = current_prediction
+            show_cols = [c for c in ["賽事編號", "馬號", "馬名", "獨贏賠率", "位置賠率", "model_win_probability", "model_race_probability", "model_rank"] if c in focused_prediction.columns]
+            st.dataframe(focused_prediction[show_cols], use_container_width=True, hide_index=True, height=320)
             st.download_button(
                 "下載預測結果 CSV",
                 data=current_prediction.to_csv(index=False).encode("utf-8-sig"),
