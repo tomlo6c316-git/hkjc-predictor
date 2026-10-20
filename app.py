@@ -47,13 +47,29 @@ FEATURE_COLS_15 = [
     '距離', 'horse_surface_win_rate', 'horse_dist_win_rate',
 ]
 
+def _model_file_signature(model_path):
+    """Return a cache key that changes when a model is added or replaced."""
+    try:
+        stat = Path(model_path).stat()
+        return f"{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        return "missing"
+
+
 @st.cache_resource
-def load_models():
-    win_m = joblib.load(MODEL_PATH) if os.path.exists(MODEL_PATH) else None
-    place_m = joblib.load(PLACE_MODEL_PATH) if os.path.exists(PLACE_MODEL_PATH) else None
+def load_models(win_model_path, place_model_path, win_signature, place_signature):
+    # Signatures are intentional cache-key inputs: a model uploaded after the
+    # first Streamlit run must not remain stuck as the previously cached None.
+    win_m = joblib.load(win_model_path) if win_signature != "missing" else None
+    place_m = joblib.load(place_model_path) if place_signature != "missing" else None
     return win_m, place_m
 
-model_win, model_place = load_models()
+model_win, model_place = load_models(
+    str(MODEL_PATH),
+    str(PLACE_MODEL_PATH),
+    _model_file_signature(MODEL_PATH),
+    _model_file_signature(PLACE_MODEL_PATH),
+)
 
 if model_win is None:
     st.error(f"⚠️ 找不到獨贏 AI 模型檔 `{MODEL_PATH}`！請確認模型是否已上傳至正確目錄。")
@@ -62,7 +78,8 @@ if model_win is None:
 if model_place is not None:
     st.sidebar.success("🧠 雙渦輪引擎已啟動：獨贏模型 + 位置模型")
 else:
-    st.sidebar.warning("⚠️ 找不到 `my_hkjc_place_model.pkl`，位置彩池將暫用獨贏模型代算。")
+    st.sidebar.warning("⚠️ 找不到 PLACE 模型，位置彩池將暫用獨贏模型代算。")
+    st.sidebar.caption(f"預期 PLACE 模型路徑：`{PLACE_MODEL_PATH}`")
 
 @st.cache_data
 def load_historical_stats(history_csv_path='hkjc_all_seasons_features.csv'):
