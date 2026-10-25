@@ -972,8 +972,9 @@ def run_monte_carlo_exotics(race_detail_df, num_sims=10000):
     if len(valid_horses) < 3:
         return None, None, None
         
-    horses = valid_horses['馬號'].astype(str).values
-    horse_names = valid_horses['馬名'].values
+    # 🐛 修復 PyArrow 2D 陣列索引報錯：強制轉為純 Numpy 陣列
+    horses = np.array(valid_horses['馬號'].astype(str).tolist())
+    horse_names = np.array(valid_horses['馬名'].astype(str).tolist())
     probs = valid_horses['pred_win_prob'].values
     
     # 標準化機率確保總和為 1
@@ -1011,9 +1012,8 @@ def run_monte_carlo_exotics(race_detail_df, num_sims=10000):
     qp_df = pd.DataFrame(qp_all, columns=['H1', 'H2'])
     qp_counts = qp_df.groupby(['H1', 'H2']).size().reset_index(name='hits')
     qp_counts['真實QP賠率'] = num_sims / qp_counts['hits']
-    qp_counts['組合名稱'] = q_counts['H1'].map(name_map) + " + " + q_counts['H2'].map(name_map)
-    qp_counts = q_counts.sort_values('真實Q賠率').head(10) # 位置Q 跟 連贏的馬名與號碼對應相同
-    qp_counts['真實QP賠率'] = qp_counts['真實Q賠率'] / 3.0 # QP 大約是 Q 的三分之一機率
+    qp_counts['組合名稱'] = qp_counts['H1'].map(name_map) + " + " + qp_counts['H2'].map(name_map)
+    qp_counts = qp_counts.sort_values('真實QP賠率').head(10)
 
     # ==========================
     # 3. 結算 單T (Trio) : 前 3 名
@@ -1022,8 +1022,8 @@ def run_monte_carlo_exotics(race_detail_df, num_sims=10000):
     trio_df = pd.DataFrame(trio, columns=['H1', 'H2', 'H3'])
     trio_counts = trio_df.groupby(['H1', 'H2', 'H3']).size().reset_index(name='hits')
     trio_counts['真實單T賠率'] = num_sims / trio_counts['hits']
-    trio_counts['組合名稱'] = trio_counts['H1'].map(name_map) + "+" + trio_counts['H2'].map(name_map) + "+" + trio_counts['H3'].map(name_map)
-    trio_counts = trio_counts.sort_values('真實單T賠率').head(5) # 取前5組
+    trio_counts['組合名稱'] = trio_counts['H1'].map(name_map) + " + " + trio_counts['H2'].map(name_map) + " + " + trio_counts['H3'].map(name_map)
+    trio_counts = trio_counts.sort_values('真實單T賠率').head(10) 
 
     return q_counts, qp_counts, trio_counts
 
