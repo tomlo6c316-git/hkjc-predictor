@@ -8,6 +8,9 @@ import requests
 import re
 import time
 import hashlib
+import sqlite3
+import threading
+import json
 from io import StringIO
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
@@ -258,8 +261,8 @@ def fetch_hkjc_racecard(race_date):
                 '練馬師': str(row[trainer_col]).strip(),
                 '實際負磅': str(row[weight_col]).strip(),
                 '排位檔位': str(row[draw_col]).strip(),
-                '獨贏賠率': 10.0,
-                '位置賠率': 1.5,
+                '獨贏賠率': np.nan,
+                '位置賠率': np.nan,
                 '距離': distance,
                 '場地': surface,
                 '賽道': course_track,
@@ -721,6 +724,310 @@ def fetch_live_odds(date_str, venue):
         return None, None, f"解析回應錯誤：{exc}"
 
 # ==========================================
+# 伺服器背景賠率更新與SQLite快照持久化
+# ==========================================
+# 可用環境變數 HKJC_STATE_DB 指向持久磁碟上的SQLite檔案。
+# 預設存於專案 data/ 資料夾；Streamlit Community Cloud的本機檔案
+# 不保證在容器重建／重新部署後保留，正式長期部署應掛載持久磁碟或改用外部DB。
+_state_db_env = os.getenv('HKJC_STATE_DB', '').strip()
+STATE_DB_PATH = Path(_state_db_env).expanduser() if _state_db_env else Path.home() / '.hkjc_state' / 'hkjc_state.sqlite3'
+
+
+def _db_connect():
+    STATE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(STATE_DB_PATH), timeout=15)
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute("""CREATE TABLE IF NOT EXISTS app_state (
+        state_key TEXT PRIMARY KEY, state_json TEXT NOT NULL, updated_at TEXT NOT NULL
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS latest_odds (
+        race_date TEXT NOT NULL, venue TEXT NOT NULL, race_no INTEGER NOT NULL,
+        pool_type TEXT NOT NULL, horse_no TEXT NOT NULL, odds REAL NOT NULL,
+        fetched_at TEXT NOT NULL, server_updated_at TEXT,
+        PRIMARY KEY (race_date, venue, race_no, pool_type, horse_no)
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS odds_fetch_status (
+        race_date TEXT NOT NULL, venue TEXT NOT NULL, last_attempt_at TEXT,
+        last_success_at TEXT, server_updated_at TEXT, error TEXT,
+        PRIMARY KEY (race_date, venue)
+    )""")
+    conn.commit()
+    return conn
+
+
+def persist_odds_result(race_date, venue, odds_by_race, server_updated_at=None, error=None, frozen_races=()):
+    now = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec='seconds')
+    conn = _db_connect()
+    try:
+        if odds_by_race:
+            frozen = {int(x) for x in frozen_races}
+            with conn:
+                for race_no, markets in odds_by_race.items():
+                    race_no = int(race_no)
+                    if race_no in frozen:
+                        continue
+                    conn.execute('DELETE FROM latest_odds WHERE race_date=? AND venue=? AND race_no=?',
+                                 (race_date, venue, race_no))
+                    for pool_type in ('WIN', 'PLA'):
+                        for horse_no, odds in (markets.get(pool_type) or {}).items():
+                            try:
+                                value = float(odds)
+                            except (TypeError, ValueError):
+                                continue
+                            if not np.isfinite(value) or value <= 0:
+                                continue
+                            conn.execute("""INSERT INTO latest_odds
+                                (race_date,venue,race_no,pool_type,horse_no,odds,fetched_at,server_updated_at)
+                                VALUES (?,?,?,?,?,?,?,?)
+                                ON CONFLICT(race_date,venue,race_no,pool_type,horse_no) DO UPDATE SET
+                                odds=excluded.odds, fetched_at=excluded.fetched_at,
+                                server_updated_at=excluded.server_updated_at""",
+                                (race_date, venue, race_no, pool_type, str(horse_no), value, now, server_updated_at))
+                conn.execute("""INSERT INTO odds_fetch_status
+                    (race_date,venue,last_attempt_at,last_success_at,server_updated_at,error)
+                    VALUES (?,?,?,?,?,NULL)
+                    ON CONFLICT(race_date,venue) DO UPDATE SET
+                    last_attempt_at=excluded.last_attempt_at,last_success_at=excluded.last_success_at,
+                    server_updated_at=excluded.server_updated_at,error=NULL""",
+                    (race_date, venue, now, now, server_updated_at))
+        else:
+            with conn:
+                conn.execute("""INSERT INTO odds_fetch_status
+                    (race_date,venue,last_attempt_at,error)
+                    VALUES (?,?,?,?)
+                    ON CONFLICT(race_date,venue) DO UPDATE SET
+                    last_attempt_at=excluded.last_attempt_at,error=excluded.error""",
+                    (race_date, venue, now, str(error or '沒有取得賠率')))
+    finally:
+        conn.close()
+    return now
+
+
+def read_persisted_odds(race_date, venue):
+    conn = _db_connect()
+    try:
+        rows = conn.execute("""SELECT race_no,pool_type,horse_no,odds FROM latest_odds
+            WHERE race_date=? AND venue=?""", (race_date, venue)).fetchall()
+        status = conn.execute("""SELECT last_attempt_at,last_success_at,server_updated_at,error
+            FROM odds_fetch_status WHERE race_date=? AND venue=?""", (race_date, venue)).fetchone()
+    finally:
+        conn.close()
+    by_race = {}
+    for race_no, pool_type, horse_no, odds in rows:
+        by_race.setdefault(int(race_no), {'WIN': {}, 'PLA': {}})[pool_type][str(horse_no)] = float(odds)
+    status_dict = None if status is None else dict(zip(
+        ('last_attempt_at','last_success_at','server_updated_at','error'), status
+    ))
+    return by_race, status_dict
+
+
+def load_persisted_app_state():
+    conn = _db_connect()
+    try:
+        rows = conn.execute('SELECT state_key,state_json FROM app_state').fetchall()
+    finally:
+        conn.close()
+    return {key: json.loads(value) for key, value in rows}
+
+
+def persist_app_state():
+    state = {
+        'simulated_bets': st.session_state.get('simulated_bets', pd.DataFrame()).to_dict(orient='records'),
+        'frozen_races': {str(k): str(v) for k,v in st.session_state.get('frozen_races', {}).items()},
+        'baseline_odds_map': st.session_state.get('baseline_odds_map', {}),
+        'baseline_locked_time': st.session_state.get('baseline_locked_time', '未鎖定'),
+        'persistent_prediction_signature': st.session_state.get('persistent_prediction_signature', ''),
+    }
+    now = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec='seconds')
+    conn = _db_connect()
+    try:
+        with conn:
+            for key, value in state.items():
+                conn.execute('''INSERT INTO app_state(state_key,state_json,updated_at)
+                    VALUES (?,?,?) ON CONFLICT(state_key) DO UPDATE SET
+                    state_json=excluded.state_json,updated_at=excluded.updated_at''',
+                    (key, json.dumps(value, ensure_ascii=False, default=str), now))
+    finally:
+        conn.close()
+
+
+if not st.session_state.get('_persistent_app_state_loaded'):
+    try:
+        _saved_state = load_persisted_app_state()
+        if _saved_state.get('simulated_bets'):
+            st.session_state['simulated_bets'] = pd.DataFrame(_saved_state['simulated_bets'])
+        if _saved_state.get('frozen_races'):
+            st.session_state['frozen_races'] = {int(k):v for k,v in _saved_state['frozen_races'].items()}
+        if _saved_state.get('baseline_odds_map'):
+            st.session_state['baseline_odds_map'] = _saved_state['baseline_odds_map']
+            st.session_state['baseline_locked_time'] = _saved_state.get('baseline_locked_time', '已從資料庫恢復')
+        if _saved_state.get('persistent_prediction_signature'):
+            st.session_state['persistent_prediction_signature'] = _saved_state['persistent_prediction_signature']
+    except Exception as _state_exc:
+        st.warning(f'持久化狀態暫時無法讀取：{_state_exc}')
+    st.session_state['_persistent_app_state_loaded'] = True
+
+
+class OddsBackgroundWorker:
+    """One process-wide poller; browser reruns only read the SQLite snapshot."""
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._wake = threading.Event()
+        self._config = None
+        self._force = False
+        self._thread = threading.Thread(target=self._run, name='hkjc-odds-worker', daemon=True)
+        self._thread.start()
+
+    def configure(self, race_date, venue, interval_seconds, enabled, frozen_races=()):
+        config = (str(race_date), str(venue), max(10, int(interval_seconds)), bool(enabled),
+                  tuple(sorted(int(x) for x in frozen_races)))
+        with self._lock:
+            changed = config != self._config
+            self._config = config
+        if changed and config[3]:
+            self._wake.set()
+
+    def request_now(self):
+        with self._lock:
+            self._force = True
+        self._wake.set()
+
+    def _run(self):
+        next_run = 0.0
+        failure_count = 0
+        while True:
+            with self._lock:
+                cfg = self._config
+                forced = self._force
+                if forced:
+                    self._force = False
+            if not cfg or (not cfg[3] and not forced):
+                self._wake.wait(2.0)
+                self._wake.clear()
+                continue
+            now_mono = time.monotonic()
+            if not forced and now_mono < next_run:
+                self._wake.wait(min(next_run-now_mono, 2.0))
+                self._wake.clear()
+                continue
+            race_date, venue, interval, enabled, frozen = cfg
+            try:
+                odds, server_time, error = fetch_live_odds(race_date, venue)
+                if odds:
+                    persist_odds_result(race_date, venue, odds, server_time, None, frozen)
+                    failure_count = 0
+                    delay = interval
+                else:
+                    persist_odds_result(race_date, venue, None, server_time, error, frozen)
+                    failure_count += 1
+                    delay = min(max(interval, 30) * (2 ** min(failure_count-1, 4)), 300)
+            except Exception as exc:
+                failure_count += 1
+                delay = min(max(interval, 30) * (2 ** min(failure_count-1, 4)), 300)
+                try:
+                    persist_odds_result(race_date, venue, None, None, f'背景worker錯誤：{type(exc).__name__}: {exc}', frozen)
+                except Exception:
+                    pass
+            next_run = time.monotonic() + delay
+
+
+@st.cache_resource
+def get_odds_background_worker():
+    return OddsBackgroundWorker()
+
+
+def apply_persisted_odds(frame, odds_by_race, frozen_races=()):
+    """Apply only real WIN/PLACE quotes; never synthesize PLA from WIN."""
+    if frame.empty or not odds_by_race:
+        return frame, 0, 0
+    out = frame.copy()
+    race_col = out['賽事編號'].map(extract_race_no)
+    horse_col = out['馬號'].map(normalize_horse_no)
+    frozen = {int(x) for x in frozen_races}
+    win_updates = place_updates = 0
+    for race_no, markets in odds_by_race.items():
+        race_no = int(race_no)
+        if race_no in frozen:
+            continue
+        race_mask = race_col == race_no
+        for horse_no, value in (markets.get('WIN') or {}).items():
+            mask = race_mask & (horse_col == normalize_horse_no(horse_no))
+            if mask.any():
+                out.loc[mask, '獨贏賠率'] = float(value)
+                win_updates += int(mask.sum())
+        for horse_no, value in (markets.get('PLA') or {}).items():
+            mask = race_mask & (horse_col == normalize_horse_no(horse_no))
+            if mask.any():
+                out.loc[mask, '位置賠率'] = float(value)
+                place_updates += int(mask.sum())
+    return out, win_updates, place_updates
+
+def run_monte_carlo_exotics(race_detail_df, num_sims=10000):
+    """
+    使用 Gumbel-max Trick，根據 AI 獨贏勝率瞬間模擬 10,000 場賽果
+    精算 連贏(Q)、位置Q(QP)、單T(Trio) 的真實公平賠率
+    """
+    # 確保只取有 AI 預測機率的馬匹
+    valid_horses = race_detail_df[race_detail_df['pred_win_prob'] > 0].copy()
+    if len(valid_horses) < 3:
+        return None, None, None
+        
+    # 🐛 修復 PyArrow 2D 陣列索引報錯：強制轉為純 Numpy 陣列
+    horses = np.array(valid_horses['馬號'].astype(str).tolist())
+    horse_names = np.array(valid_horses['馬名'].astype(str).tolist())
+    probs = valid_horses['pred_win_prob'].values
+    
+    # 標準化機率確保總和為 1
+    probs = probs / np.sum(probs)
+    
+    # 🎲 蒙地卡羅核心：Gumbel 隨機擾動模擬 10,000 場賽馬的衝線分數
+    np.random.seed(int(time.time()))
+    gumbel_noise = np.random.gumbel(0, 1, size=(num_sims, len(horses)))
+    scores = np.log(probs + 1e-10) + gumbel_noise
+    
+    # 取出每場模擬前 3 名的索引值
+    top3_idx = np.argsort(-scores, axis=1)[:, :3]
+    top3_horses = horses[top3_idx]
+    
+    # 構建名稱對照字典
+    name_map = dict(zip(horses, horse_names))
+
+    # ==========================
+    # 1. 結算 連贏 (Q) : 前 2 名
+    # ==========================
+    q_combos = np.sort(top3_horses[:, :2], axis=1)
+    q_df = pd.DataFrame(q_combos, columns=['H1', 'H2'])
+    q_counts = q_df.groupby(['H1', 'H2']).size().reset_index(name='hits')
+    q_counts['真實Q賠率'] = num_sims / q_counts['hits']
+    q_counts['組合名稱'] = q_counts['H1'].map(name_map) + " + " + q_counts['H2'].map(name_map)
+    q_counts = q_counts.sort_values('真實Q賠率').head(10) # 取最熱門前10組
+
+    # ==========================
+    # 2. 結算 位置Q (QP) : 前 3 名內任 2 匹
+    # ==========================
+    qp1 = np.sort(top3_horses[:, [0, 1]], axis=1)
+    qp2 = np.sort(top3_horses[:, [0, 2]], axis=1)
+    qp3 = np.sort(top3_horses[:, [1, 2]], axis=1)
+    qp_all = np.vstack([qp1, qp2, qp3])
+    qp_df = pd.DataFrame(qp_all, columns=['H1', 'H2'])
+    qp_counts = qp_df.groupby(['H1', 'H2']).size().reset_index(name='hits')
+    qp_counts['真實QP賠率'] = num_sims / qp_counts['hits']
+    qp_counts['組合名稱'] = qp_counts['H1'].map(name_map) + " + " + qp_counts['H2'].map(name_map)
+    qp_counts = qp_counts.sort_values('真實QP賠率').head(10)
+
+    # ==========================
+    # 3. 結算 單T (Trio) : 前 3 名
+    # ==========================
+    trio = np.sort(top3_horses[:, :3], axis=1)
+    trio_df = pd.DataFrame(trio, columns=['H1', 'H2', 'H3'])
+    trio_counts = trio_df.groupby(['H1', 'H2', 'H3']).size().reset_index(name='hits')
+    trio_counts['真實單T賠率'] = num_sims / trio_counts['hits']
+    trio_counts['組合名稱'] = trio_counts['H1'].map(name_map) + " + " + trio_counts['H2'].map(name_map) + " + " + trio_counts['H3'].map(name_map)
+    trio_counts = trio_counts.sort_values('真實單T賠率').head(10) 
+
+    return q_counts, qp_counts, trio_counts
+
+# ==========================================
 # 決定讀取哪一份賽卡資料
 # ==========================================
 fetched_prediction_df = st.session_state.get('fetched_prediction_df')
@@ -753,41 +1060,14 @@ auto_odds_status = None
 if fetched_prediction_df is not None and st.session_state.pop('pending_auto_odds_fetch', False):
     odds_date = st.session_state.get('fetched_prediction_date', race_date_choice).strftime('%Y-%m-%d')
     odds_venue = str(df_raw['racecourse_code'].iloc[0])
-    with st.spinner('排位已載入，正在嘗試取得該日 WIN／PLACE 賠率…'):
-        odds_by_race, odds_updated_at, odds_error = fetch_live_odds(odds_date, odds_venue)
-    if odds_by_race:
-        win_count = place_count = 0
-        for idx, runner in df_raw.iterrows():
-            race_no = extract_race_no(runner.get('賽事編號', ''))
-            horse_no = normalize_horse_no(runner.get('馬號', ''))
-            race_market = odds_by_race.get(race_no, {})
-            win_price = race_market.get('WIN', {}).get(horse_no)
-            place_price = race_market.get('PLA', {}).get(horse_no)
-            if win_price is not None and win_price > 0:
-                df_raw.at[idx, '獨贏賠率'] = win_price
-                # 🔥 強制使用獨贏賠率推算位置賠率，完全不看官方 place_price
-                df_raw.at[idx, '位置賠率'] = 1.0 + (win_price - 1.0) / 3.2
-                win_count += 1
-                place_count += 1
-        st.session_state['df_data'] = df_raw.copy()
-        st.session_state['fetched_prediction_df'] = df_raw.copy()
-        
-        base_map = {}
-        for _, r in df_raw.iterrows():
-            k = f"{normalize_race_id(r['賽事編號'])}_{normalize_horse_no(r['馬號'])}"
-            base_map[k] = float(r['獨贏賠率'])
-        st.session_state['baseline_odds_map'] = base_map
-        st.session_state['baseline_locked_time'] = datetime.now(hk_timezone).strftime("%H:%M:%S")
-        
-        auto_odds_status = f'已自動更新即時賠率並鎖定初始基準：WIN {win_count} 匹／PLACE {place_count} 匹'
-    else:
-        auto_odds_status = f'目前未能取得已開出的官方賠率。'
+    initial_worker = get_odds_background_worker()
+    initial_worker.configure(odds_date, odds_venue, 30, False, ())
+    initial_worker.request_now()
+    st.session_state['awaiting_initial_odds'] = True
+    auto_odds_status = '排位已載入；伺服器正在背景取得官方WIN／PLACE賠率。'
 
 if auto_odds_status:
-    if auto_odds_status.startswith('已自動'):
-        st.sidebar.success(auto_odds_status)
-    else:
-        st.sidebar.warning(auto_odds_status)
+    st.sidebar.info(auto_odds_status)
 
 # 確保賠率、賽道與跑法欄位存在
 if '獨贏賠率' not in df_raw.columns:
@@ -797,16 +1077,10 @@ else:
 
 win_values = df_raw['獨贏賠率']
 if '位置賠率' not in df_raw.columns:
-    df_raw['位置賠率'] = 1.0 + (win_values - 1.0) / 3.2
+    df_raw['位置賠率'] = np.nan
 else:
-    # 先將內容轉為數字
+    # Preserve official PLACE quotes; missing values remain blank rather than guessed.
     df_raw['位置賠率'] = pd.to_numeric(df_raw['位置賠率'], errors='coerce')
-    # 🔥 關鍵新增：判斷是否「整欄全部都是 1.5」(這代表是系統爬蟲產生的預設假資料)
-    if (df_raw['位置賠率'] == 1.5).all():
-        df_raw['位置賠率'] = 1.0 + (win_values - 1.0) / 3.2
-    else:
-        # 如果不是整欄 1.5，代表可能有真實賠率，只把裡面的空值 (NaN) 用公式補算
-        df_raw['位置賠率'] = df_raw['位置賠率'].fillna(1.0 + (win_values - 1.0) / 3.2)
 if '賽道' not in df_raw.columns:
     df_raw['賽道'] = 'A'
 if '跑法' not in df_raw.columns:
@@ -814,6 +1088,11 @@ if '跑法' not in df_raw.columns:
 
 # 每次切換檔案時，將版本號 +1 強制刷新表格，並初始化基準賠率
 if 'df_data' not in st.session_state or st.session_state.get('prediction_signature') != prediction_signature:
+    previous_signature = st.session_state.get('persistent_prediction_signature')
+    if previous_signature and previous_signature != prediction_signature:
+        # Do not carry frozen race numbers from a different racecard/meeting.
+        st.session_state['frozen_races'] = {}
+    st.session_state['persistent_prediction_signature'] = prediction_signature
     st.session_state['df_data'] = df_raw.copy()
     st.session_state['prediction_signature'] = prediction_signature
     st.session_state['odds_editor_version'] = st.session_state.get('odds_editor_version', 0) + 1
@@ -857,7 +1136,7 @@ edited_df = st.data_editor(
 
 # 同步手動修改的賠率與跑法回 session_state['df_data']
 st.session_state['df_data']['獨贏賠率'] = pd.to_numeric(edited_df['獨贏賠率'], errors='coerce').fillna(10.0)
-st.session_state['df_data']['位置賠率'] = pd.to_numeric(edited_df['位置賠率'], errors='coerce').fillna(1.0 + (st.session_state['df_data']['獨贏賠率'] - 1.0) / 3.2)
+st.session_state['df_data']['位置賠率'] = pd.to_numeric(edited_df['位置賠率'], errors='coerce')
 st.session_state['df_data']['跑法'] = edited_df['跑法']
 
 df = st.session_state['df_data'].copy()
@@ -1106,6 +1385,7 @@ tab1, tab2 = st.tabs(["🎯 各場次預測推薦與單場凍結", "📈 歷史�
 # ---------------- 分頁 1: 賽前預測 ----------------
 with tab1:
     st.subheader("⚡ 臨場賠率更新中心與單場盤口凍結")
+    st.info("賠率由伺服器背景執行緒更新，成功報價與狀態寫入SQLite；手機離線／關閉分頁時，worker在主機仍運作便可繼續。注意：Streamlit Cloud休眠或重建時worker會停止，本機SQLite也不保證跨重建保存；需持久磁碟或外部資料庫才有跨重啟保證。")
     
     col_v, col_d, col_r, col_t = st.columns([1.2, 1.8, 1.2, 1.8])
     fetched_venue = str(df_raw['racecourse_code'].iloc[0]) if 'racecourse_code' in df_raw.columns else ''
@@ -1205,15 +1485,18 @@ with tab1:
     if not is_target_frozen:
         if f_col1.button(f"🔒 凍結第 {target_race} 場【買時賠率】 (下注後點擊)", use_container_width=True, type="primary"):
             st.session_state['frozen_races'][int(target_race)] = datetime.now(hk_timezone).strftime("%H:%M:%S")
+            persist_app_state()
             st.rerun()
     else:
         frozen_t = st.session_state['frozen_races'][int(target_race)]
         if f_col1.button(f"🔓 解除第 {target_race} 場凍結 (已鎖於 {frozen_t})", use_container_width=True):
             st.session_state['frozen_races'].pop(int(target_race), None)
+            persist_app_state()
             st.rerun()
 
     if f_col2.button("🔓 全部場次解除凍結", use_container_width=True, disabled=len(st.session_state['frozen_races']) == 0):
         st.session_state['frozen_races'] = {}
+        persist_app_state()
         st.rerun()
 
     frozen_list_str = ", ".join([f"R{r}({t})" for r, t in sorted(st.session_state['frozen_races'].items())]) if st.session_state['frozen_races'] else "尚無凍結場次"
@@ -1226,56 +1509,69 @@ with tab1:
             base_map[k] = float(r['獨贏賠率'])
         st.session_state['baseline_odds_map'] = base_map
         st.session_state['baseline_locked_time'] = datetime.now(hk_timezone).strftime("%H:%M:%S")
+        persist_app_state()
         st.rerun()
 
-    if auto_refresh:
-        st_autorefresh(interval=int(refresh_seconds * 1000), key="hkjc_live_odds_autorefresh")
+    odds_worker = get_odds_background_worker()
+    odds_worker.configure(
+        api_date, venue_code, refresh_seconds, auto_refresh,
+        st.session_state.get('frozen_races', {}).keys()
+    )
 
-    if auto_refresh or manual_refresh:
-        with st.spinner("正在讀取當日 WIN／PLACE 即時賠率（自動跳過已凍結場次）…"):
-            live_by_race, server_updated_at, error = fetch_live_odds(api_date, venue_code)
+    if manual_refresh:
+        odds_worker.request_now()
+        st.session_state['manual_odds_request_at'] = datetime.now(hk_timezone).isoformat(timespec='seconds')
+        st.session_state['awaiting_manual_odds'] = True
+        st.session_state['odds_last_status'] = '已要求伺服器背景更新；正在等待結果…'
 
-        if live_by_race:
-            df_temp = st.session_state['df_data'].copy()
-            row_races = df_temp['賽事編號'].map(extract_race_no)
-            row_horses = df_temp['馬號'].map(normalize_horse_no)
-            updated_races_count = 0
-            skipped_frozen = []
+    if auto_refresh or st.session_state.get('awaiting_initial_odds') or st.session_state.get('awaiting_manual_odds'):
+        # UI polling only reads the database. HKJC requests run in the worker thread.
+        ui_interval = 2000 if (st.session_state.get('awaiting_initial_odds') or st.session_state.get('awaiting_manual_odds')) else int(refresh_seconds * 1000)
+        st_autorefresh(interval=ui_interval, key="hkjc_odds_snapshot_ui_refresh")
 
-            for race_no, markets in live_by_race.items():
-                r_int = int(race_no)
-                if r_int in st.session_state['frozen_races']:
-                    skipped_frozen.append(f"R{r_int}")
-                    continue
-                updated_races_count += 1
-                race_mask = row_races == r_int
-                for horse_no, value in markets['WIN'].items():
-                    horse_mask = race_mask & (row_horses == horse_no)
-                    df_temp.loc[horse_mask, '獨贏賠率'] = value
-                    # 🔥 強制使用最新的獨贏賠率，連動推算位置賠率
-                    df_temp.loc[horse_mask, '位置賠率'] = 1.0 + (value - 1.0) / 3.2
-                    
-                # (原本抓取官方 PLA 的迴圈已被徹底刪除)
-
-            if st.session_state.get('baseline_locked_time') == "初始載入值":
-                base_map = {}
-                for _, r in df_temp.iterrows():
-                    k = f"{normalize_race_id(r['賽事編號'])}_{normalize_horse_no(r['馬號'])}"
-                    base_map[k] = float(r['獨贏賠率'])
-                st.session_state['baseline_odds_map'] = base_map
-                st.session_state['baseline_locked_time'] = f"首次自動鎖定 ({datetime.now(hk_timezone).strftime('%H:%M:%S')})"
-
+    persisted_by_race, persisted_status = read_persisted_odds(api_date, venue_code)
+    sync_key = f"{prediction_signature}|{api_date}|{venue_code}"
+    success_at = (persisted_status or {}).get('last_success_at')
+    applied_map = st.session_state.setdefault('persisted_odds_applied_at', {})
+    if persisted_by_race and success_at and applied_map.get(sync_key) != success_at:
+        df_temp = st.session_state['df_data'].copy()
+        df_temp, win_count, place_count = apply_persisted_odds(
+            df_temp, persisted_by_race, st.session_state.get('frozen_races', {}).keys()
+        )
+        applied_map[sync_key] = success_at
+        if win_count or place_count:
             st.session_state['df_data'] = df_temp
             st.session_state['odds_editor_version'] = st.session_state.get('odds_editor_version', 0) + 1
-            skip_msg = f"（已保護跳過凍結場次：{', '.join(skipped_frozen)}）" if skipped_frozen else ""
-            st.session_state['odds_last_status'] = f"✅ 成功更新 {updated_races_count} 場最新賠率 {skip_msg}（時間：{datetime.now(hk_timezone).strftime('%H:%M:%S')}）。"
-            st.session_state['odds_server_time'] = server_updated_at
+            st.session_state['odds_server_time'] = (persisted_status or {}).get('server_updated_at')
+            st.session_state['odds_last_status'] = (
+                f"已載入持久化賠率：WIN {win_count} 匹／官方PLACE {place_count} 匹；"
+                f"伺服器成功更新時間 {success_at}。"
+            )
+            st.session_state['odds_last_error'] = (persisted_status or {}).get('error')
+            persist_app_state()
+            st.rerun()
+
+    if persisted_status:
+        if persisted_status.get('last_attempt_at'):
+            manual_requested_at = st.session_state.get('manual_odds_request_at')
+            if manual_requested_at and persisted_status.get('last_attempt_at') >= manual_requested_at:
+                st.session_state.pop('awaiting_manual_odds', None)
+            if st.session_state.get('awaiting_initial_odds') and persisted_status.get('last_attempt_at'):
+                st.session_state.pop('awaiting_initial_odds', None)
+        if persisted_status.get('error'):
+            st.session_state['odds_last_error'] = (
+                f"背景更新最近一次失敗：{persisted_status['error']}。"
+                f"保留上次成功賠率時間：{persisted_status.get('last_success_at') or '尚無'}"
+            )
+        elif persisted_status.get('last_success_at'):
             st.session_state['odds_last_error'] = None
-            if manual_refresh: st.rerun()
-        else:
-            st.session_state['odds_last_error'] = f"⚠️ 無法取得賠率：{error}"
-            st.session_state['odds_last_status'] = None
-            if manual_refresh: st.rerun()
+            if auto_refresh:
+                st.session_state['odds_last_status'] = (
+                    f"伺服器背景更新運作中；最近成功 {persisted_status['last_success_at']}，"
+                    f"HKJC資料時間 {persisted_status.get('server_updated_at') or '未提供'}。"
+                )
+    if manual_refresh:
+        st.info('背景更新請求已送出。若此畫面尚未顯示新賠率，稍候一次畫面刷新即可；成功報價已寫入SQLite。')
 
     locked_time_str = st.session_state.get('baseline_locked_time', '未鎖定')
     form_mode_str = "🔥 真實近況與同程算分" if use_dynamic_form else "🎯 1004 爆冷模式 (固定常數算分)"
@@ -1388,6 +1684,38 @@ with tab1:
             '位置注碼': race_detail_df['suggested_stake_place'].apply(lambda x: f"${x:.0f}")
         })
         st.dataframe(display_detail, use_container_width=True, hide_index=True)
+        # === 🎲 蒙地卡羅 10,000 場賽事虛擬演練 ===
+    # === 🎲 蒙地卡羅 10,000 場賽事虛擬演練 ===
+    st.markdown(f"#### 🎲 第 {target_race} 場 — 蒙地卡羅 AI 串關尋優引擎 (10,000 次賽果模擬)")
+    
+    # 1. 點擊按鈕時，算出結果並「永久存入」快取記憶體
+    if st.button("🚀 啟動 10,000 場蒙地卡羅模擬算牌", use_container_width=True):
+        with st.spinner("正在背景執行 10,000 場平行時空模擬..."):
+            time.sleep(0.3) 
+            df_q, df_qp, df_trio = run_monte_carlo_exotics(race_detail_df)
+            
+            # 將結果與當前場次綁定並寫入 Session State
+            st.session_state['mc_results'] = (df_q, df_qp, df_trio)
+            st.session_state['mc_target_race'] = target_race
+            
+    # 2. 脫離按鈕的壽命限制：只要快取裡有「當前場次」的結果，就持續顯示它！
+    if st.session_state.get('mc_results') and st.session_state.get('mc_target_race') == target_race:
+        df_q, df_qp, df_trio = st.session_state['mc_results']
+        
+        if df_q is not None:
+            m_col1, m_col2, m_col3 = st.columns(3)
+            
+            with m_col1:
+                st.success("🔗 連贏 (Q) 真實公平賠率")
+                st.dataframe(df_q[['H1', 'H2', '組合名稱', 'hits', '真實Q賠率']].rename(columns={'hits': '模擬命中次數', 'H1': '馬1', 'H2': '馬2'}).style.format({'真實Q賠率': '{:.1f}'}), hide_index=True)
+                
+            with m_col2:
+                st.warning("🥉 位置Q (QP) 真實公平賠率")
+                st.dataframe(df_qp[['H1', 'H2', '組合名稱', '真實QP賠率']].rename(columns={'H1': '馬1', 'H2': '馬2'}).style.format({'真實QP賠率': '{:.1f}'}), hide_index=True)
+                
+            with m_col3:
+                st.info("🏆 單T (Trio) 真實公平賠率")
+                st.dataframe(df_trio[['H1', 'H2', 'H3', '組合名稱', 'hits', '真實單T賠率']].rename(columns={'hits': '模擬命中次數', 'H1': '馬1', 'H2': '馬2', 'H3': '馬3'}).style.format({'真實單T賠率': '{:.0f}'}), hide_index=True)
 
     st.markdown("---")
     st.subheader("🛒 虛擬模擬投注站 (Paper Trading)")
@@ -1449,6 +1777,7 @@ with tab1:
             st.session_state['simulated_bets'] = pd.DataFrame(columns=[
                 '下注時間', '賽事編號', '場次', '馬號', '馬名', '玩法', '買入賠率', '注碼'
             ])
+            persist_app_state()
             st.rerun()
 
 # ---------------- 分頁 2: 賽後回測 ----------------
@@ -1805,3 +2134,9 @@ with tab2:
 
                     st.markdown("##### 🧾 模擬投注詳細結算單")
                     st.dataframe(pd.DataFrame(sim_results), use_container_width=True, hide_index=True)
+
+# Persist user state after each completed run; SQLite writes are small and local.
+try:
+    persist_app_state()
+except Exception as _persist_exc:
+    st.warning(f'保存SQLite狀態失敗：{_persist_exc}')
