@@ -1685,27 +1685,37 @@ with tab1:
         })
         st.dataframe(display_detail, use_container_width=True, hide_index=True)
         # === 🎲 蒙地卡羅 10,000 場賽事虛擬演練 ===
+    # === 🎲 蒙地卡羅 10,000 場賽事虛擬演練 ===
     st.markdown(f"#### 🎲 第 {target_race} 場 — 蒙地卡羅 AI 串關尋優引擎 (10,000 次賽果模擬)")
     
+    # 1. 點擊按鈕時，算出結果並「永久存入」快取記憶體
     if st.button("🚀 啟動 10,000 場蒙地卡羅模擬算牌", use_container_width=True):
         with st.spinner("正在背景執行 10,000 場平行時空模擬..."):
-            time.sleep(0.3) # 刻意營造算牌儀式感，其實 Gumbel 運算只要 0.05 秒
+            time.sleep(0.3) 
             df_q, df_qp, df_trio = run_monte_carlo_exotics(race_detail_df)
             
-            if df_q is not None:
-                m_col1, m_col2, m_col3 = st.columns(3)
+            # 將結果與當前場次綁定並寫入 Session State
+            st.session_state['mc_results'] = (df_q, df_qp, df_trio)
+            st.session_state['mc_target_race'] = target_race
+            
+    # 2. 脫離按鈕的壽命限制：只要快取裡有「當前場次」的結果，就持續顯示它！
+    if st.session_state.get('mc_results') and st.session_state.get('mc_target_race') == target_race:
+        df_q, df_qp, df_trio = st.session_state['mc_results']
+        
+        if df_q is not None:
+            m_col1, m_col2, m_col3 = st.columns(3)
+            
+            with m_col1:
+                st.success("🔗 連贏 (Q) 真實公平賠率")
+                st.dataframe(df_q[['H1', 'H2', '組合名稱', 'hits', '真實Q賠率']].rename(columns={'hits': '模擬命中次數', 'H1': '馬1', 'H2': '馬2'}).style.format({'真實Q賠率': '{:.1f}'}), hide_index=True)
                 
-                with m_col1:
-                    st.success("🔗 連贏 (Q) 真實公平賠率")
-                    st.dataframe(df_q[['H1', 'H2', '組合名稱', 'hits', '真實Q賠率']].rename(columns={'hits': '模擬命中次數', 'H1': '馬1', 'H2': '馬  2'}).style.format({'真實Q賠率': '{:.1f}'}), hide_index=True)
-                    
-                with m_col2:
-                    st.warning("🥉 位置Q (QP) 真實公平賠率")
-                    st.dataframe(df_qp[['H1', 'H2', '組合名稱', '真實QP賠率']].rename(columns={'H1': '馬1', 'H2': '馬2'}).style.format({'真實QP賠率': '{:.1f}'}), hide_index=True)
-                    
-                with m_col3:
-                    st.info("🏆 單T (Trio) 真實公平賠率")
-                    st.dataframe(df_trio[['H1', 'H2', 'H3', '組合名稱', 'hits', '真實單T賠率']].rename(columns={'hits': '模擬命中次數', 'H1': '馬1', 'H2': '馬2', 'H3': '馬3'}).style.format({'真實單T賠率': '{:.0f}'}), hide_index=True)
+            with m_col2:
+                st.warning("🥉 位置Q (QP) 真實公平賠率")
+                st.dataframe(df_qp[['H1', 'H2', '組合名稱', '真實QP賠率']].rename(columns={'H1': '馬1', 'H2': '馬2'}).style.format({'真實QP賠率': '{:.1f}'}), hide_index=True)
+                
+            with m_col3:
+                st.info("🏆 單T (Trio) 真實公平賠率")
+                st.dataframe(df_trio[['H1', 'H2', 'H3', '組合名稱', 'hits', '真實單T賠率']].rename(columns={'hits': '模擬命中次數', 'H1': '馬1', 'H2': '馬2', 'H3': '馬3'}).style.format({'真實單T賠率': '{:.0f}'}), hide_index=True)
 
     st.markdown("---")
     st.subheader("🛒 虛擬模擬投注站 (Paper Trading)")
